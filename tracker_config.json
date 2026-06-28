@@ -1,0 +1,44 @@
+{
+  "baseline": 200.0,
+  "max_delta": 185.0,
+  "coupling": 0.4,
+  "smoothing": {
+    "enabled": true,
+    "ema_alpha": 0.35,
+    "median_window": 3,
+    "deadband": 0.015
+  },
+  "mac_hand": {
+    "A0:F2:62:F2:27:A4": "right"
+  },
+  "hands": {
+    "left": {
+      "electrode_map": {
+        "mid_p": 0,
+        "mid_d": 1,
+        "ring_p": 2,
+        "ring_d": 3,
+        "pinky_p": 4,
+        "pinky_d": 5,
+        "thumb_p": 6,
+        "thumb_d": 7,
+        "index_p": 8,
+        "index_d": 9
+      }
+    },
+    "right": {
+      "electrode_map": {
+        "mid_p": 0,
+        "mid_d": 1,
+        "ring_p": 2,
+        "ring_d": 3,
+        "pinky_p": 4,
+        "pinky_d": 5,
+        "thumb_p": null,
+        "thumb_d": null,
+        "index_p": null,
+        "index_d": null
+      }
+    }
+  }
+}

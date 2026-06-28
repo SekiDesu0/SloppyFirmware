@@ -1,108 +1,248 @@
+// SloppyFirmware v2
+// Reliable ESP32-S3 firmware for SloppyHands glove.
+// Reads all 12 MPR121 electrodes and streams them to a server over UDP.
+//
+// State machine: PROVISIONING -> CONNECTING -> DISCOVERING -> STREAMING
+// Provisioning waits for serial `wifi set <ssid> <pass>` if no creds stored.
+
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
-#include <Wire.h>
-#include "Adafruit_MPR121.h"
+#include <esp_task_wdt.h>
 
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
-const int udpPort = 4242;
+#include "config.h"
+#include "StatusLED.h"
+#include "WifiManager.h"
+#include "SerialCLI.h"
+#include "SensorMPR121.h"
+#include "Discovery.h"
+#include "PacketIO.h"
+#include "DeviceConfig.h"
 
-// Auto-discovery variables
-IPAddress targetIP;
-bool clientConnected = false;
+// --- Globals (externs for SerialCLI callbacks) ------------------------------
+WifiManager   wifi;
+SensorMPR121  sensor;
+StatusLED     led;
+Discovery     discovery;
+SerialCLI     cli;
+DeviceConfig  deviceCfg;
 
-#define I2C_SDA 8
-#define I2C_SCL 9
-#define RGB_LED 48 // Standard WS2812 pin for S3 SuperMini clones
+DeviceState   state = DeviceState::Provisioning;
+uint32_t      packetId       = 0;
+uint32_t      lastHelloMs     = 0;
+uint32_t      lastFrameMs    = 0;
+uint32_t      lastKeepaliveMs = 0;
+uint32_t      stateEnterMs   = 0;
 
-Adafruit_MPR121 cap = Adafruit_MPR121();
-WiFiUDP udp;
-
-struct __attribute__((packed)) FingerData {
-  uint32_t packetId;
-  uint16_t mid_p;  uint16_t mid_d;
-  uint16_t ring_p; uint16_t ring_d;
-  uint16_t pinky_p; uint16_t pinky_d;
-  uint16_t i2cReadTimeMs;
-  uint16_t totalLoopTimeMs;
-};
-
-uint32_t packetCount = 0;
-unsigned long lastFrameTime = 0;
-const int TARGET_FPS = 50;
-const int FRAME_TIME_MS = 1000 / TARGET_FPS;
-
-void setup() {
-  Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(400000); 
-
-  if (!cap.begin(0x5A)) {
-    while (1) { delay(10); } 
-  }
-
-  cap.writeRegister(MPR121_ECR, 0x00);
-  cap.writeRegister(MPR121_AUTOCONFIG0, 0x00);
-  cap.writeRegister(MPR121_AUTOCONFIG1, 0x00);
-  cap.writeRegister(MPR121_CONFIG1, 0x10); 
-  cap.writeRegister(MPR121_CONFIG2, 0x20); 
-  cap.writeRegister(MPR121_ECR, 0x8F);
-
-  // Turn LED Red while connecting
-  neopixelWrite(RGB_LED, 10, 0, 0);
-
-  WiFi.begin(ssid, password);
-  WiFi.setSleep(WIFI_PS_NONE); 
-  while (WiFi.status() != WL_CONNECTED) { delay(500); }
-
-  // Turn LED Yellow while waiting for Python discovery ping
-  neopixelWrite(RGB_LED, 10, 10, 0);
-
-  // Start listening for the Python ping
-  udp.begin(udpPort);
+// --- CLI callbacks ----------------------------------------------------------
+static void cb_status() {
+    Serial.printf("state=%s fw=%u uptime=%lus pkts=%lu\r\n",
+        state == DeviceState::Provisioning ? "provisioning" :
+        state == DeviceState::Connecting   ? "connecting"   :
+        state == DeviceState::Discovering  ? "discovering"  :
+                                             "streaming",
+        cfg::FW_VERSION,
+        (unsigned long)(millis() / 1000),
+        (unsigned long)packetId);
+    Serial.println(wifi.statusLine());
+    Serial.printf("hand=%s sensor=%s channels=%u\r\n",
+        deviceCfg.handString(),
+        sensor.present() ? "ok" : "absent",
+        cfg::CHANNEL_COUNT);
+    if (discovery.hasServer()) {
+        Serial.printf("server=%s:%u keepaliveMs=%lu lastKeepaliveAgo=%lums\r\n",
+            discovery.serverIP().toString().c_str(),
+            discovery.dataPort(),
+            (unsigned long)discovery.keepaliveMs(),
+            (long)(millis() - lastKeepaliveMs));
+    } else {
+        Serial.println("server=none");
+    }
 }
 
-void loop() {
-  // Phase 1: Wait for Python to reveal its IP
-  if (!clientConnected) {
-    if (udp.parsePacket()) {
-      targetIP = udp.remoteIP();
-      clientConnected = true;
-      // Turn LED Green when target is locked
-      neopixelWrite(RGB_LED, 0, 10, 0);
-      
-      // Flush the buffer
-      while(udp.available()) udp.read();
+static bool cb_wifiSet(const String& ssid, const String& pass) {
+    return wifi.setCredentials(ssid, pass);
+}
+static void cb_wifiClear() {
+    wifi.clearCredentials();
+}
+
+static void cb_handSet(uint8_t h) {
+    deviceCfg.setHand(h);
+}
+
+// --- Helpers ----------------------------------------------------------------
+static void enterState(DeviceState s) {
+    state       = s;
+    stateEnterMs = millis();
+    led.setState(s);
+}
+
+static void watchdogInit() {
+    // Arduino-ESP32 2.0.x legacy WDT API
+    esp_task_wdt_init(10000, true);  // 10s timeout, panic on trip
+    esp_task_wdt_add(NULL);
+}
+
+// --- Setup ------------------------------------------------------------------
+void setup() {
+    Serial.begin(115200);
+    delay(50);  // let CDC settle
+    led.begin(cfg::RGB_LED);
+    led.setState(DeviceState::Provisioning);
+
+    watchdogInit();
+
+    bool sensorOk = sensor.begin(cfg::MPR121_ADDR,
+                                 cfg::I2C_SDA, cfg::I2C_SCL,
+                                 cfg::I2C_CLOCK_HZ);
+    if (!sensorOk) {
+        Serial.printf("[BOOT] MPR121 not found at 0x%02X. Proceeding without sensor (server will get empty frames).\r\n",
+            cfg::MPR121_ADDR);
+    } else {
+        Serial.println("[BOOT] MPR121 initialized (12 channels).");
     }
+
+    deviceCfg.begin();
+    Serial.printf("[BOOT] Hand assignment: %s (use serial 'hand left|right|auto' to change)\r\n",
+        deviceCfg.handString());
+
+    cli.begin(cb_status, cb_wifiSet, cb_wifiClear, cb_handSet);
+
+    if (wifi.hasCredentials()) {
+        String ssid, pass;
+        wifi.getCredentials(ssid, pass);
+        Serial.printf("[BOOT] Stored creds found for \"%s\". Connecting...\r\n",
+            ssid.c_str());
+        wifi.beginConnect();
+        enterState(DeviceState::Connecting);
+        discovery.begin(cfg::UDP_PORT);
+    } else {
+        Serial.println("[BOOT] No WiFi creds stored. Waiting for serial 'wifi set <ssid> <pass>'.");
+        enterState(DeviceState::Provisioning);
+    }
+}
+
+// --- State-specific loops ---------------------------------------------------
+static void loopProvisioning() {
+    // Re-print instructions every few seconds so a serial monitor opened
+    // after boot still learns what to do. Non-blocking.
+    static uint32_t lastHintMs = 0;
+    if (millis() - lastHintMs > 3000) {
+        lastHintMs = millis();
+        Serial.println();
+        Serial.println("==============================================");
+        Serial.println(" No WiFi credentials stored.");
+        Serial.println(" Type:  wifi set <ssid> <pass>");
+        Serial.println(" Then press Enter. Device will reboot & connect.");
+        Serial.println(" Other commands: status | wifi clear | reset | help");
+        Serial.println("==============================================");
+        Serial.print("> ");
+    }
+}
+
+static void loopConnecting() {
+    if (wifi.update()) {
+        Serial.printf("[NET] WiFi connected. IP=%s RSSI=%d. Entering discovery.\r\n",
+            wifi.ip().toString().c_str(),
+            (int)wifi.rssi());
+        if (!discovery.hasServer()) {
+            // (re)start UDP listening on the local port if not already
+            discovery.begin(cfg::UDP_PORT);
+        }
+        enterState(DeviceState::Discovering);
+    }
+}
+
+static void loopDiscovering() {
+    if (millis() - lastHelloMs >= cfg::HELLO_INTERVAL_MS) {
+        lastHelloMs = millis();
+        discovery.sendHello(deviceCfg.getHand());
+    }
+
+    WelcomePacket w;
+    KeepalivePacket k;
+    PacketType t = discovery.pump(w, k);
+    if (t == PacketType::Welcome) {
+        // Discovery::pump captured the sender IP internally; use w to set
+        // the data port and keepalive cadence.
+        discovery.setServer(discovery.serverIP(), w.dataPort, w.keepaliveMs);
+        Serial.printf("[DISC] Server welcomed us: %s port=%u keepalive=%lums\r\n",
+            discovery.serverIP().toString().c_str(),
+            w.dataPort, (unsigned long)w.keepaliveMs);
+        lastKeepaliveMs = millis();
+        enterState(DeviceState::Streaming);
+    }
+}
+
+static void loopStreaming() {
+    // 1) Drain inbound (keepalive / welcome / bye)
+    WelcomePacket w;
+    KeepalivePacket k;
+    PacketType t = discovery.pump(w, k);
+    if (t == PacketType::Keepalive) {
+        lastKeepaliveMs = millis();
+    } else if (t == PacketType::Welcome) {
+        // server restarted; re-arm
+        discovery.setServer(discovery.serverIP(), w.dataPort, w.keepaliveMs);
+        lastKeepaliveMs = millis();
+    }
+
+    // 2) Check keepalive timeout -> back to discovery
+    if (millis() - lastKeepaliveMs > cfg::KEEPALIVE_TIMEOUT_MS) {
+        Serial.println("[DISC] Keepalive timeout. Returning to discovery.");
+        discovery.clearServer();
+        enterState(DeviceState::Discovering);
+        return;
+    }
+
+    // 3) Check WiFi drop
+    if (wifi.hadDisconnect() || !wifi.isConnected()) {
+        Serial.println("[NET] WiFi dropped. Returning to CONNECTING.");
+        discovery.clearServer();
+        enterState(DeviceState::Connecting);
+        return;
+    }
+
+    // 4) Stream sensor frame at ~50 FPS
+    uint32_t now = millis();
+    if (now - lastFrameMs >= cfg::FRAME_TIME_MS) {
+        unsigned long loopStart = millis();
+        uint16_t filtered[12] = {0};
+        uint16_t touch = 0;
+        if (sensor.present()) {
+            unsigned long i2cStart = millis();
+            touch = sensor.readAll(filtered);
+            uint16_t i2cMs = (uint16_t)(millis() - i2cStart);
+            uint16_t loopMs = (uint16_t)(millis() - loopStart);
+
+            DataPacket p;
+            PacketIO::buildData(p, packetId++, filtered, touch,
+                                i2cMs, loopMs, wifi.rssi());
+            discovery.sendData(p);
+        }
+        lastFrameMs = now;
+    }
+}
+
+// --- Loop -------------------------------------------------------------------
+void loop() {
+    esp_task_wdt_reset();
+    cli.update();
+    led.tick();
+
+    switch (state) {
+        case DeviceState::Provisioning: loopProvisioning(); break;
+        case DeviceState::Connecting:    loopConnecting();  break;
+        case DeviceState::Discovering:   loopDiscovering(); break;
+        case DeviceState::Streaming:     loopStreaming();   break;
+    }
+
+    // Universal WiFi drop detection (catches both CONNECTING and after STREAMING)
+    if (state != DeviceState::Provisioning && wifi.hadDisconnect()) {
+        Serial.println("[NET] WiFi disconnected by event.");
+        discovery.clearServer();
+        enterState(DeviceState::Connecting);
+    }
+
     yield();
-    return; // Do not run the sensor loop yet
-  }
-
-  // Phase 2: Blast data to the locked IP
-  unsigned long currentMillis = millis();
-  if (currentMillis - lastFrameTime >= FRAME_TIME_MS) {
-    unsigned long loopStart = millis();
-
-    FingerData payload;
-    payload.packetId = packetCount++;
-
-    unsigned long readStart = millis();
-    payload.mid_p = cap.filteredData(0);
-    payload.mid_d = cap.filteredData(1);
-    payload.ring_p = cap.filteredData(2);
-    payload.ring_d = cap.filteredData(3);
-    payload.pinky_p = cap.filteredData(4);
-    payload.pinky_d = cap.filteredData(5);
-    payload.i2cReadTimeMs = millis() - readStart;
-
-    payload.totalLoopTimeMs = millis() - loopStart;
-
-    udp.beginPacket(targetIP, udpPort);
-    udp.write((uint8_t*)&payload, sizeof(payload));
-    udp.endPacket();
-
-    lastFrameTime = currentMillis;
-  }
-  
-  yield(); 
 }
