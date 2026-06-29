@@ -4,8 +4,16 @@ import json
 import math
 import os
 import time
+import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, scrolledtext
+
+try:
+    import serial
+    import serial.tools.list_ports
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
 
 # Optional SteamVR fusion (right controller only - thumb + index)
 try:
@@ -84,6 +92,8 @@ DEFAULTS = {
         "median_window": 3,      # odd
         "deadband":      0.015,  # ignore changes smaller than this (0..1)
     },
+    "serial_port": "",
+    "serial_baud": "115200",
     "mac_hand": {},  # { "mac_str": "left"/"right" }
     "hands": {
         "left":  {"electrode_map": DEFAULT_MAP_LEFT},
@@ -523,7 +533,6 @@ bottom.add(map_tabs["right"], text="Right hand map")
 
 # Settings tab
 settings_tab = tk.Frame(bottom, bg="#222")
-settings_tab.pack(fill=tk.BOTH, expand=True)
 bottom.add(settings_tab, text="Settings")
 
 baseline_var  = tk.DoubleVar(value=cfg["baseline"])
@@ -558,6 +567,146 @@ for v in (baseline_var, max_delta_var, coupling_var,
     v.trace_add("write", on_map_changed)
 on_map_changed()
 
+# ---------------------------------------------------------------------------
+# Serial Console tab
+# ---------------------------------------------------------------------------
+serial_tab = tk.Frame(bottom, bg="#222")
+bottom.add(serial_tab, text="Serial Console")
+
+_serial_port = None
+_serial_thread = None
+_serial_running = False
+
+def _list_serial_ports():
+    if not SERIAL_AVAILABLE:
+        return []
+    return [p.device for p in serial.tools.list_ports.comports()]
+
+def _serial_read_loop(sp, append_fn):
+    global _serial_running
+    while _serial_running and sp and sp.is_open:
+        try:
+            if sp.in_waiting:
+                data = sp.read(sp.in_waiting)
+                append_fn(data.decode("utf-8", errors="replace"))
+            time.sleep(0.02)
+        except Exception:
+            break
+
+def _serial_connect(port_var, baud_var, btn, append_fn, send_entry, send_btn):
+    global _serial_port, _serial_thread, _serial_running
+    if _serial_port and _serial_port.is_open:
+        _serial_running = False
+        time.sleep(0.1)
+        try:
+            _serial_port.close()
+        except Exception:
+            pass
+        _serial_port = None
+        btn.configure(text="Connect")
+        send_entry.configure(state=tk.DISABLED)
+        send_btn.configure(state=tk.DISABLED)
+        append_fn("\n--- Disconnected ---\n")
+        return
+    if not SERIAL_AVAILABLE:
+        append_fn("Error: pyserial not installed. Run: pip install pyserial\n")
+        return
+    port = port_var.get()
+    if not port:
+        append_fn("No port selected.\n")
+        return
+    try:
+        sp = serial.Serial(port, int(baud_var.get()), timeout=0.1)
+        _serial_port = sp
+        _serial_running = True
+        cfg["serial_port"] = port
+        cfg["serial_baud"] = baud_var.get()
+        save_config(cfg)
+        _serial_thread = threading.Thread(target=_serial_read_loop, args=(sp, append_fn), daemon=True)
+        _serial_thread.start()
+        btn.configure(text="Disconnect")
+        send_entry.configure(state=tk.NORMAL)
+        send_btn.configure(state=tk.NORMAL)
+        append_fn(f"--- Connected to {port} @ {baud_var.get()} ---\n")
+    except Exception as e:
+        append_fn(f"Error: {e}\n")
+
+def _serial_send(entry):
+    global _serial_port
+    if not _serial_port or not _serial_port.is_open:
+        return
+    line = entry.get()
+    if not line:
+        return
+    entry.delete(0, tk.END)
+    try:
+        _serial_port.write((line + "\r\n").encode())
+    except Exception:
+        pass
+
+# Top controls row
+ctrl_frame = tk.Frame(serial_tab, bg="#222")
+ctrl_frame.pack(fill=tk.X, padx=6, pady=4)
+
+port_var = tk.StringVar(value=cfg.get("serial_port", ""))
+baud_var = tk.StringVar(value=cfg.get("serial_baud", "115200"))
+
+tk.Label(ctrl_frame, text="Port:", bg="#222", fg="#00FF00", font=("Consolas", 9)).pack(side=tk.LEFT, padx=2)
+port_menu = ttk.Combobox(ctrl_frame, textvariable=port_var, values=_list_serial_ports(), width=16)
+port_menu.pack(side=tk.LEFT, padx=2)
+
+tk.Label(ctrl_frame, text="Baud:", bg="#222", fg="#00FF00", font=("Consolas", 9)).pack(side=tk.LEFT, padx=2)
+baud_menu = ttk.Combobox(ctrl_frame, textvariable=baud_var, values=["9600", "115200", "230400", "921600"], width=8)
+baud_menu.pack(side=tk.LEFT, padx=2)
+
+def _refresh_ports():
+    port_menu.configure(values=_list_serial_ports())
+    if not port_var.get() and _list_serial_ports():
+        port_var.set(_list_serial_ports()[0])
+    ctrl_frame.after(2000, _refresh_ports)
+
+conn_btn = tk.Button(ctrl_frame, text="Connect", bg="#333", fg="#0F0",
+                     font=("Consolas", 9), command=lambda: _serial_connect(
+                         port_var, baud_var, conn_btn, _serial_append, send_entry, send_btn))
+conn_btn.pack(side=tk.LEFT, padx=6)
+
+tk.Button(ctrl_frame, text="Refresh", bg="#333", fg="#FF0", font=("Consolas", 9),
+          command=lambda: port_menu.configure(values=_list_serial_ports())).pack(side=tk.LEFT, padx=2)
+
+# Output area (read-only, shows only device output)
+serial_out = scrolledtext.ScrolledText(serial_tab, bg="#111", fg="#0F0",
+                                        font=("Consolas", 10), height=8, wrap=tk.WORD,
+                                        state=tk.DISABLED)
+serial_out.pack(fill=tk.BOTH, expand=True, padx=6, pady=2)
+
+def _serial_append(text):
+    serial_out.configure(state=tk.NORMAL)
+    serial_out.insert(tk.END, text)
+    serial_out.see(tk.END)
+    serial_out.configure(state=tk.DISABLED)
+
+_serial_append("--- Serial Console ---\n")
+_serial_append("Connect to the device's serial port and type commands.\n")
+_serial_append("Use 'wifi set <ssid> <pass>' to configure WiFi.\n\n")
+
+# Bottom send row — separate input bar
+send_frame = tk.Frame(serial_tab, bg="#222")
+send_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
+
+tk.Label(send_frame, text=">", bg="#222", fg="#0F0", font=("Consolas", 12, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+
+send_entry = tk.Entry(send_frame, bg="#111", fg="#0F0", font=("Consolas", 11),
+                       insertbackground="#0F0", disabledbackground="#333", disabledforeground="#555",
+                       relief=tk.FLAT, highlightthickness=1, highlightbackground="#555")
+send_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4), ipady=4)
+send_entry.configure(state=tk.DISABLED)
+send_entry.bind("<Return>", lambda e: _serial_send(send_entry))
+
+send_btn = tk.Button(send_frame, text="Send", bg="#333", fg="#0F0", font=("Consolas", 9),
+                      state=tk.DISABLED, command=lambda: _serial_send(send_entry))
+send_btn.pack(side=tk.LEFT, padx=(0, 2))
+
+_refresh_ports()
 
 # ---------------------------------------------------------------------------
 # Channel bars + skeleton drawing -- PRE-ALLOCATED canvas items.

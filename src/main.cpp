@@ -9,6 +9,9 @@
 #include <WiFi.h>
 #include <esp_task_wdt.h>
 
+// Run CPU at 80 MHz instead of 240 MHz — plenty for 50 FPS I2C + UDP
+static constexpr unsigned long CPU_FREQ_MHZ = 80;
+
 #include "config.h"
 #include "StatusLED.h"
 #include "WifiManager.h"
@@ -78,8 +81,12 @@ static void enterState(DeviceState s) {
 }
 
 static void watchdogInit() {
-    // Arduino-ESP32 2.0.x legacy WDT API
-    esp_task_wdt_init(10000, true);  // 10s timeout, panic on trip
+    const esp_task_wdt_config_t cfg = {
+        .timeout_ms = 10000,
+        .idle_core_mask = 0,
+        .trigger_panic = true
+    };
+    esp_task_wdt_init(&cfg);
     esp_task_wdt_add(NULL);
 }
 
@@ -87,6 +94,7 @@ static void watchdogInit() {
 void setup() {
     Serial.begin(115200);
     delay(50);  // let CDC settle
+    setCpuFrequencyMhz(CPU_FREQ_MHZ);
     led.begin(cfg::RGB_LED);
     led.setState(DeviceState::Provisioning);
 
@@ -221,6 +229,8 @@ static void loopStreaming() {
             discovery.sendData(p);
         }
         lastFrameMs = now;
+    } else {
+        delay(1);
     }
 }
 

@@ -54,7 +54,7 @@ void WifiManager::beginConnect() {
         g_self = this;
         WiFi.onEvent(wifiEventHandler);
     }
-    WiFi.setSleep(WIFI_PS_NONE);
+    WiFi.setSleep(WIFI_PS_MIN_MODEM);
     WiFi.setHostname("sloppyhands");
     WiFi.begin(_ssid.c_str(), _pass.c_str());
     _lastAttempt = millis();
