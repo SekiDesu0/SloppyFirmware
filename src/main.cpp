@@ -81,12 +81,16 @@ static void enterState(DeviceState s) {
 }
 
 static void watchdogInit() {
+#if ESP_IDF_VERSION_MAJOR >= 5
     const esp_task_wdt_config_t cfg = {
         .timeout_ms = 10000,
         .idle_core_mask = 0,
         .trigger_panic = true
     };
     esp_task_wdt_init(&cfg);
+#else
+    esp_task_wdt_init(10000, true);
+#endif
     esp_task_wdt_add(NULL);
 }
 
