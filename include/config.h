@@ -8,7 +8,7 @@ namespace cfg {
 #if defined(ESP8266)
     constexpr int      I2C_SDA       = 4;    // GPIO4 (D2)
     constexpr int      I2C_SCL       = 5;    // GPIO5 (D1)
-    constexpr int      RGB_LED       = 2;    // GPIO2 (D4) — built-in LED on many boards
+    constexpr int      RGB_LED       = 12;   // GPIO12 (D6) — external NeoPixel; NOT the built-in LED (that's a regular GPIO LED on GPIO2)
 #else
     constexpr int      I2C_SDA       = 8;
     constexpr int      I2C_SCL       = 9;
