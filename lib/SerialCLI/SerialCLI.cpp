@@ -43,7 +43,7 @@ void SerialCLI::_help() {
     Serial.println("  hand right                Mark this device as the RIGHT hand");
     Serial.println("  hand auto                 Clear hand assignment (unknown)");
     Serial.println("  status                   Print device diagnostics");
-    Serial.println("  reset                    Soft-reset the ESP32");
+    Serial.println("  reset                    Soft-reset the device");
     Serial.println("  help                     Show this message");
 }
 

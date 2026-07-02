@@ -1,6 +1,10 @@
 #include "Discovery.h"
 #include "config.h"
+#if defined(ESP8266)
+#include <ESP8266WiFi.h>
+#else
 #include <WiFi.h>
+#endif
 
 void Discovery::begin(uint16_t port) {
     if (_udpStarted && _localPort == port) return;  // idempotent

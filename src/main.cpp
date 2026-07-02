@@ -1,15 +1,18 @@
 // SloppyFirmware v2
-// Reliable ESP32-S3 firmware for SloppyHands glove.
 // Reads all 12 MPR121 electrodes and streams them to a server over UDP.
 //
 // State machine: PROVISIONING -> CONNECTING -> DISCOVERING -> STREAMING
 // Provisioning waits for serial `wifi set <ssid> <pass>` if no creds stored.
 
 #include <Arduino.h>
+#if defined(ESP8266)
+#include <ESP8266WiFi.h>
+#else
 #include <WiFi.h>
 #include <esp_task_wdt.h>
+#endif
 
-// Run CPU at 80 MHz instead of 240 MHz — plenty for 50 FPS I2C + UDP
+// Run CPU at 80 MHz instead of 240 MHz
 static constexpr unsigned long CPU_FREQ_MHZ = 80;
 
 #include "config.h"
@@ -81,6 +84,7 @@ static void enterState(DeviceState s) {
 }
 
 static void watchdogInit() {
+#if defined(ESP32)
 #if ESP_IDF_VERSION_MAJOR >= 5
     const esp_task_wdt_config_t cfg = {
         .timeout_ms = 10000,
@@ -92,13 +96,18 @@ static void watchdogInit() {
     esp_task_wdt_init(10000, true);
 #endif
     esp_task_wdt_add(NULL);
+#endif
 }
 
 // --- Setup ------------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
-    delay(50);  // let CDC settle
+    delay(50);
+#if defined(ESP32)
     setCpuFrequencyMhz(CPU_FREQ_MHZ);
+#elif defined(ESP8266)
+    system_update_cpu_freq(CPU_FREQ_MHZ);
+#endif
     led.begin(cfg::RGB_LED);
     led.setState(DeviceState::Provisioning);
 
@@ -113,6 +122,7 @@ void setup() {
     } else {
         Serial.println("[BOOT] MPR121 initialized (12 channels).");
     }
+    led.setSensorAbsent(!sensorOk);
 
     deviceCfg.begin();
     Serial.printf("[BOOT] Hand assignment: %s (use serial 'hand left|right|auto' to change)\r\n",
@@ -221,17 +231,17 @@ static void loopStreaming() {
         unsigned long loopStart = millis();
         uint16_t filtered[12] = {0};
         uint16_t touch = 0;
+        uint16_t i2cMs = 0;
         if (sensor.present()) {
             unsigned long i2cStart = millis();
             touch = sensor.readAll(filtered);
-            uint16_t i2cMs = (uint16_t)(millis() - i2cStart);
-            uint16_t loopMs = (uint16_t)(millis() - loopStart);
-
-            DataPacket p;
-            PacketIO::buildData(p, packetId++, filtered, touch,
-                                i2cMs, loopMs, wifi.rssi());
-            discovery.sendData(p);
+            i2cMs = (uint16_t)(millis() - i2cStart);
         }
+        uint16_t loopMs = (uint16_t)(millis() - loopStart);
+        DataPacket p;
+        PacketIO::buildData(p, packetId++, filtered, touch,
+                            i2cMs, loopMs, wifi.rssi());
+        discovery.sendData(p);
         lastFrameMs = now;
     } else {
         delay(1);
@@ -240,7 +250,9 @@ static void loopStreaming() {
 
 // --- Loop -------------------------------------------------------------------
 void loop() {
+#if defined(ESP32)
     esp_task_wdt_reset();
+#endif
     cli.update();
     led.tick();
 

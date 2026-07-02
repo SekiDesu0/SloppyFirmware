@@ -1,5 +1,9 @@
 #include "PacketIO.h"
+#if defined(ESP8266)
+#include <ESP8266WiFi.h>
+#else
 #include <WiFi.h>
+#endif
 
 void PacketIO::initHeader(Header& h, PacketType t) {
     h.magic      = cfg::MAGIC;

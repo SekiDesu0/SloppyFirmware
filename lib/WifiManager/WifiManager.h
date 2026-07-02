@@ -1,41 +1,39 @@
 #pragma once
 #include <Arduino.h>
+#if defined(ESP8266)
+#include <ESP8266WiFi.h>
+#include <EEPROM.h>
+#else
 #include <Preferences.h>
+#endif
 
 class WifiManager {
 public:
-    // Returns true if credentials are present in NVS.
     bool hasCredentials();
-
-    // Store creds and persist. Returns false if ssid empty.
     bool setCredentials(const String& ssid, const String& pass);
     void clearCredentials();
-
-    // Load credentials into the provided buffers.
     void getCredentials(String& ssid, String& pass);
 
-    // Kick off a connection attempt (async). Use isConnectBlocking=false to return immediately.
     void beginConnect();
     bool isConnected();
-
-    // Polling helper for the FSM. Returns true once connected.
     bool update();
-
-    // WiFi disconnect event flag for FSM. Set internally; FSM clears.
     bool hadDisconnect();
-
-    // Called from the static WiFi event handler.
     void markDisconnect();
 
-    // Diagnostics for `status` command.
     String statusLine();
-
     IPAddress ip();
     int8_t   rssi();
     String   mac();
 
 private:
+#if defined(ESP32)
     Preferences _prefs;
+#else
+    static constexpr uint8_t EE_SSID_OFF = 0;
+    static constexpr uint8_t EE_PASS_OFF = 48;
+    static constexpr uint8_t EE_MAGIC_OFF = 112;
+    static constexpr uint8_t EE_MAGIC = 0xA5;
+#endif
     String _ssid;
     String _pass;
     uint32_t _lastAttempt = 0;

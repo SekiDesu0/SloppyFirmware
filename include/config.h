@@ -2,14 +2,21 @@
 #include <cstdint>
 
 // ---------------------------------------------------------------------------
-// Board / wiring
+// Board / wiring — defaults per platform
 // ---------------------------------------------------------------------------
 namespace cfg {
+#if defined(ESP8266)
+    constexpr int      I2C_SDA       = 4;    // GPIO4 (D2)
+    constexpr int      I2C_SCL       = 5;    // GPIO5 (D1)
+    constexpr int      RGB_LED       = 2;    // GPIO2 (D4) — built-in LED on many boards
+#else
     constexpr int      I2C_SDA       = 8;
     constexpr int      I2C_SCL       = 9;
+    constexpr int      RGB_LED       = 48;   // WS2812 on S3 SuperMini clones
+#endif
+
     constexpr uint8_t  MPR121_ADDR   = 0x5A;
     constexpr uint32_t I2C_CLOCK_HZ  = 400000;
-    constexpr int      RGB_LED       = 48;   // WS2812 on S3 SuperMini clones
 
     // ---------------------------------------------------------------------------
     // Network
