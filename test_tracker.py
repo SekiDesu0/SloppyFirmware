@@ -616,7 +616,14 @@ def _serial_connect(port_var, baud_var, btn, append_fn, send_entry, send_btn):
         append_fn("No port selected.\n")
         return
     try:
-        sp = serial.Serial(port, int(baud_var.get()), timeout=0.1)
+        sp = serial.Serial()
+        sp.port = port
+        sp.baudrate = int(baud_var.get())
+        sp.timeout = 0.1
+        # The SlimeVR magic trick: release the reset pins before opening
+        sp.dtr = False
+        sp.rts = False
+        sp.open()
         _serial_port = sp
         _serial_running = True
         cfg["serial_port"] = port
