@@ -162,6 +162,11 @@ their default and re-pair.
 | Solid red          | Connecting    | Attempting WiFi association              |
 | Yellow pulse       | Discovering   | WiFi up; broadcasting HELLO              |
 | Solid green        | Streaming     | Sending DATA frames to server            |
+| Purple SOS (morse) | Sensor absent | No MPR121/FDC2214 detected on the I2C bus |
+
+The sensor-absent pattern overrides all other states: the LED blinks `...`
+`---` `...` in purple until a sensor is found (re-probed on reboot, or switch
+the active sensor with `sensor auto|mpr121|fdc2214`).
 
 ## Wiring
 
