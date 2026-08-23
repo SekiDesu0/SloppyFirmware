@@ -14,6 +14,7 @@
 //   3 = DATA       (device  -> server  )   12-channel sensor frame
 //   4 = KEEPALIVE  (server  -> device  )   heartbeat, echoes lastSeenPacketId
 //   5 = BYE        (either  -> either  )   graceful close (optional)
+//   6 = TUNNEL     (dongle  -> PC      )   ESP-NOW DATA framed with source MAC + RSSI
 // ---------------------------------------------------------------------------
 
 enum class PacketType : uint8_t {
@@ -21,7 +22,8 @@ enum class PacketType : uint8_t {
     Welcome   = 2,
     Data      = 3,
     Keepalive = 4,
-    Bye       = 5
+    Bye       = 5,
+    Tunnel    = 6
 };
 
 struct __attribute__((packed)) Header {
@@ -66,6 +68,17 @@ struct __attribute__((packed)) KeepalivePacket {
     uint32_t lastSeenPacketId;
 };
 
+// Dongle -> PC framing over USB HID: the ESP-NOW DATA packet plus the source
+// MAC (UDP gets sender IP for free; HID reports don't carry an address) and
+// the RSSI measured by the dongle. 82 bytes total.
+struct __attribute__((packed)) TunnelPacket {
+    Header   h;
+    uint8_t  mac[6];       // source glove MAC
+    int8_t   rssi;         // ESP-NOW rx RSSI at the dongle (0 = unknown)
+    uint8_t  reserved;
+    DataPacket data;       // embedded DATA frame
+};
+
 namespace PacketIO {
     void initHeader(Header& h, PacketType t);
     void buildHello(HelloPacket& p, const uint8_t mac[6], uint8_t hand);
@@ -73,8 +86,10 @@ namespace PacketIO {
                    const uint16_t filtered[12], uint16_t touch,
                    const uint32_t fdcRaw[4], uint8_t sensorType,
                    uint16_t i2cMs, uint16_t loopMs, int8_t rssi);
+    void buildTunnel(TunnelPacket& t, const uint8_t mac[6], int8_t rssi, const DataPacket& d);
 
     bool parseWelcome(const uint8_t* buf, size_t len, WelcomePacket& out);
     bool parseKeepalive(const uint8_t* buf, size_t len, KeepalivePacket& out);
+    bool parseTunnel(const uint8_t* buf, size_t len, TunnelPacket& out);
     bool isHeaderValid(const Header& h, PacketType expected);
 }

@@ -16,10 +16,27 @@ public:
     void setSensorMode(uint8_t m);
     const char* sensorModeString() const;
 
+    // Transport selection (wifi UDP vs ESP-NOW dongle)
+    uint8_t getTransport() const { return _transport; }
+    void setTransport(uint8_t t);
+    const char* transportString() const;
+
+    // Paired ESP-NOW dongle (MAC + Wi-Fi channel)
+    bool hasPair() const { return _hasPair; }
+    void getPairMac(uint8_t macOut[6]) const { memcpy(macOut, _pairMac, 6); }
+    uint8_t getPairChannel() const { return _pairChannel; }
+    void setPair(const uint8_t mac[6], uint8_t channel);
+    void clearPair();
+
 private:
 #if defined(ESP32)
     Preferences _prefs;
 #endif
+    void _savePair();
     uint8_t     _hand = cfg::HAND_UNKNOWN;
     uint8_t     _sensorMode = cfg::SENSOR_MODE_DEFAULT;
+    uint8_t     _transport  = cfg::TRANSPORT_DEFAULT;
+    bool        _hasPair    = false;
+    uint8_t     _pairMac[6] = {0};
+    uint8_t     _pairChannel = cfg::ESPNOW_CHANNEL_DEFAULT;
 };

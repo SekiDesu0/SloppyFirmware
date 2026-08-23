@@ -2,15 +2,20 @@
 #include "config.h"
 
 void SerialCLI::begin(StatusFn statusFn, WifiSetFn wifiSetFn, WifiClearFn wifiClearFn,
-                      HandSetFn handSetFn, SensorSetFn sensorSetFn) {
+                      HandSetFn handSetFn, SensorSetFn sensorSetFn,
+                      TransportSetFn transportSetFn, PairClearFn pairClearFn,
+                      I2cScanFn i2cScanFn) {
     _statusFn    = statusFn;
     _wifiSetFn   = wifiSetFn;
     _wifiClearFn = wifiClearFn;
     _handSetFn   = handSetFn;
     _sensorSetFn = sensorSetFn;
+    _transportSetFn = transportSetFn;
+    _pairClearFn    = pairClearFn;
+    _i2cScanFn      = i2cScanFn;
     _started = true;
     Serial.println();
-    Serial.println("SloppyFirmware v3 - serial CLI ready.");
+    Serial.println("SloppyFirmware v5 - serial CLI ready.");
     _help();
     Serial.print("> ");
 }
@@ -48,6 +53,10 @@ void SerialCLI::_help() {
     Serial.println("  sensor auto               Auto-detect sensor (FDC2214 then MPR121)");
     Serial.println("  sensor mpr121             Force MPR121 sensor");
     Serial.println("  sensor fdc2214            Force FDC2214 sensor");
+    Serial.println("  transport espnow          Stream to the ESP32-S3 dongle over ESP-NOW");
+    Serial.println("  transport wifi            Stream over WiFi UDP (legacy server)");
+    Serial.println("  pair clear                Forget the paired ESP-NOW dongle");
+    Serial.println("  i2cscan                   Probe the I2C bus for sensors");
     Serial.println("  status                   Print device diagnostics");
     Serial.println("  reset                    Soft-reset the device");
     Serial.println("  help                     Show this message");
@@ -90,6 +99,33 @@ void SerialCLI::_exec(const String& line) {
             m == cfg::SENSOR_MODE_FDC2214 ? "fdc2214" : "auto");
         delay(200);
         ESP.restart();
+        return;
+    }
+
+    if (t.startsWith("transport ")) {
+        String arg = t.substring(10);
+        arg.trim();
+        uint8_t tr;
+        if (arg == "espnow")      tr = cfg::TRANSPORT_ESPNOW;
+        else if (arg == "wifi")   tr = cfg::TRANSPORT_WIFI;
+        else { Serial.println("Usage: transport espnow | transport wifi"); return; }
+        if (_transportSetFn) _transportSetFn(tr);
+        Serial.printf("Transport set to %s. Rebooting...\r\n",
+            tr == cfg::TRANSPORT_ESPNOW ? "espnow" : "wifi");
+        delay(200);
+        ESP.restart();
+        return;
+    }
+
+    if (t == "pair clear") {
+        if (_pairClearFn) _pairClearFn();
+        Serial.println("Paired dongle forgotten.");
+        return;
+    }
+
+    if (t == "i2cscan") {
+        if (_i2cScanFn) _i2cScanFn();
+        else Serial.println("i2cscan not supported on this build.");
         return;
     }
 

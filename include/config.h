@@ -40,6 +40,14 @@ namespace cfg {
     constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
     constexpr uint32_t WIFI_RETRY_INTERVAL_MS  = 2000;
 
+    // ESP-NOW link (gloves <-> dongle). Glove hops channels while DISCOVERING
+    // until a WELCOME arrives; the dongle listens on its fixed channel.
+    constexpr uint8_t  ESPNOW_CHANNEL_DEFAULT  = 1;
+    constexpr uint8_t  ESPNOW_CHANNEL_MIN      = 1;
+    constexpr uint8_t  ESPNOW_CHANNEL_MAX      = 13;   // EU/US overlap: use <=11 for US-only setups
+    constexpr uint32_t ESPNOW_HOP_INTERVAL_MS  = 300;  // per-channel dwell in DISCOVERING
+    constexpr uint8_t  ESPNOW_MAX_PEERS        = 8;    // dongle peer table size
+
     // ---------------------------------------------------------------------------
     // State machine timings
     // ---------------------------------------------------------------------------
@@ -58,12 +66,18 @@ namespace cfg {
     // ---------------------------------------------------------------------------
     // Firmware / protocol IDs
     // ---------------------------------------------------------------------------
-    constexpr uint8_t  FW_VERSION = 4;
+    constexpr uint8_t  FW_VERSION = 5;
 
     // Hand identifiers carried in HELLO
     constexpr uint8_t  HAND_UNKNOWN = 0;
     constexpr uint8_t  HAND_LEFT    = 1;
     constexpr uint8_t  HAND_RIGHT   = 2;
+
+    // Runtime transport selection (persisted in NVS/EEPROM). `espnow` streams to
+    // an ESP32-S3 HID dongle over ESP-NOW; `wifi` uses the classic UDP path.
+    constexpr uint8_t  TRANSPORT_WIFI    = 0;
+    constexpr uint8_t  TRANSPORT_ESPNOW  = 1;
+    constexpr uint8_t  TRANSPORT_DEFAULT = TRANSPORT_ESPNOW;
 
     // Sensor type carried in DATA.sensorType
     constexpr uint8_t  SENSOR_TYPE_NONE    = 0;

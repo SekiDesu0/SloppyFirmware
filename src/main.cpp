@@ -5,6 +5,7 @@
 // Provisioning waits for serial `wifi set <ssid> <pass>` if no creds stored.
 
 #include <Arduino.h>
+#include <Wire.h>
 #if defined(ESP8266)
 #include <ESP8266WiFi.h>
 #else
@@ -22,8 +23,10 @@ static constexpr unsigned long CPU_FREQ_MHZ = 80;
 #include "SensorMPR121.h"
 #include "SensorFDC2214.h"
 #include "Discovery.h"
+#include "EspNowTransport.h"
 #include "PacketIO.h"
 #include "DeviceConfig.h"
+#include "SensorTransport.h"
 
 // --- Globals (externs for SerialCLI callbacks) ------------------------------
 WifiManager   wifi;
@@ -31,8 +34,12 @@ SensorMPR121  sensor;
 SensorFDC2214 fdcSensor;
 StatusLED     led;
 Discovery     discovery;
+EspNowTransport espnowLink;
 SerialCLI     cli;
 DeviceConfig  deviceCfg;
+
+SensorTransport* transportPtr   = nullptr;   // active link (UDP or ESP-NOW)
+uint8_t          activeTransport = cfg::TRANSPORT_DEFAULT;
 
 DeviceState   state = DeviceState::Provisioning;
 uint32_t      packetId       = 0;
@@ -52,21 +59,17 @@ static void cb_status() {
         cfg::FW_VERSION,
         (unsigned long)(millis() / 1000),
         (unsigned long)packetId);
-    Serial.println(wifi.statusLine());
-    Serial.printf("hand=%s sensorMode=%s sensorType=%s channels=%u\r\n",
+    Serial.printf("transport=%s hand=%s sensorMode=%s sensorType=%s channels=%u\r\n",
+        activeTransport == cfg::TRANSPORT_ESPNOW ? "espnow" : "wifi",
         deviceCfg.handString(),
         deviceCfg.sensorModeString(),
         sensorType == cfg::SENSOR_TYPE_MPR121  ? "mpr121" :
         sensorType == cfg::SENSOR_TYPE_FDC2214 ? "fdc2214" : "none",
         sensorType == cfg::SENSOR_TYPE_FDC2214 ? cfg::FDC_CHANNEL_COUNT : cfg::CHANNEL_COUNT);
-    if (discovery.hasServer()) {
-        Serial.printf("server=%s:%u keepaliveMs=%lu lastKeepaliveAgo=%lums\r\n",
-            discovery.serverIP().toString().c_str(),
-            discovery.dataPort(),
-            (unsigned long)discovery.keepaliveMs(),
-            (long)(millis() - lastKeepaliveMs));
+    if (transportPtr) {
+        Serial.println(transportPtr->statusLine());
     } else {
-        Serial.println("server=none");
+        Serial.println("link=none");
     }
 }
 
@@ -83,6 +86,33 @@ static void cb_handSet(uint8_t h) {
 
 static void cb_sensorSet(uint8_t mode) {
     deviceCfg.setSensorMode(mode);
+}
+
+static void cb_transportSet(uint8_t tr) {
+    deviceCfg.setTransport(tr);
+}
+
+static void cb_pairClear() {
+    deviceCfg.clearPair();
+    espnowLink.clearPair();
+}
+
+static void cb_i2cScan() {
+    Wire.begin(cfg::I2C_SDA, cfg::I2C_SCL);
+    Wire.setClock(cfg::I2C_CLOCK_HZ);
+    Serial.printf("Scanning I2C bus (SDA=%d SCL=%d)...\r\n", cfg::I2C_SDA, cfg::I2C_SCL);
+    uint8_t found = 0;
+    for (uint8_t a = 0x03; a <= 0x77; a++) {
+        Wire.beginTransmission(a);
+        if (Wire.endTransmission() == 0) {
+            Serial.printf("  0x%02X%s\r\n", a,
+                a == cfg::MPR121_ADDR ? "  <- MPR121" :
+                (a == 0x2A || a == 0x2B) ? "  <- FDC2214" : "");
+            found++;
+        }
+        yield();
+    }
+    if (!found) Serial.println("  (bus empty - check wiring/power/ADDR pin)");
 }
 
 // --- Helpers ----------------------------------------------------------------
@@ -123,6 +153,9 @@ void setup() {
     watchdogInit();
 
     deviceCfg.begin();
+    activeTransport = deviceCfg.getTransport();
+    Serial.printf("[BOOT] Transport: %s (use serial 'transport wifi|espnow' to change)\r\n",
+        activeTransport == cfg::TRANSPORT_ESPNOW ? "espnow" : "wifi");
     Serial.printf("[BOOT] Hand assignment: %s (use serial 'hand left|right|auto' to change)\r\n",
         deviceCfg.handString());
     Serial.printf("[BOOT] Sensor mode: %s (use serial 'sensor auto|mpr121|fdc2214' to change)\r\n",
@@ -158,16 +191,38 @@ void setup() {
     }
     led.setSensorAbsent(sensorType == cfg::SENSOR_TYPE_NONE);
 
-    cli.begin(cb_status, cb_wifiSet, cb_wifiClear, cb_handSet, cb_sensorSet);
+    if (activeTransport == cfg::TRANSPORT_ESPNOW) {
+        // ESP-NOW mode: no WiFi credentials needed; pair with the dongle.
+        transportPtr = &espnowLink;
+        uint8_t pairMac[6];
+        if (deviceCfg.hasPair()) {
+            deviceCfg.getPairMac(pairMac);
+            espnowLink.configure(deviceCfg.getPairChannel(), pairMac);
+            Serial.printf("[BOOT] Remembered dongle %02X:%02X:%02X:%02X:%02X:%02X on ch%u. Hello!\r\n",
+                pairMac[0], pairMac[1], pairMac[2], pairMac[3], pairMac[4], pairMac[5],
+                deviceCfg.getPairChannel());
+        } else {
+            espnowLink.configure(cfg::ESPNOW_CHANNEL_DEFAULT, nullptr);
+            Serial.println("[BOOT] No dongle paired yet. Channel-hopping discovery.");
+        }
+    } else {
+        transportPtr = &discovery;
+    }
 
-    if (wifi.hasCredentials()) {
+    cli.begin(cb_status, cb_wifiSet, cb_wifiClear, cb_handSet, cb_sensorSet,
+              cb_transportSet, cb_pairClear, cb_i2cScan);
+
+    if (activeTransport == cfg::TRANSPORT_ESPNOW) {
+        transportPtr->begin();
+        enterState(DeviceState::Discovering);
+    } else if (wifi.hasCredentials()) {
         String ssid, pass;
         wifi.getCredentials(ssid, pass);
         Serial.printf("[BOOT] Stored creds found for \"%s\". Connecting...\r\n",
             ssid.c_str());
         wifi.beginConnect();
         enterState(DeviceState::Connecting);
-        discovery.begin(cfg::UDP_PORT);
+        transportPtr->begin();
     } else {
         Serial.println("[BOOT] No WiFi creds stored. Waiting for serial 'wifi set <ssid> <pass>'.");
         enterState(DeviceState::Provisioning);
@@ -206,21 +261,24 @@ static void loopConnecting() {
 }
 
 static void loopDiscovering() {
-    if (millis() - lastHelloMs >= cfg::HELLO_INTERVAL_MS) {
+    if (millis() - lastHelloMs >= transportPtr->helloIntervalMs()) {
         lastHelloMs = millis();
-        discovery.sendHello(deviceCfg.getHand());
+        transportPtr->sendHello(deviceCfg.getHand());
     }
 
     WelcomePacket w;
     KeepalivePacket k;
-    PacketType t = discovery.pump(w, k);
-    if (t == PacketType::Welcome) {
-        // Discovery::pump captured the sender IP internally; use w to set
-        // the data port and keepalive cadence.
-        discovery.setServer(discovery.serverIP(), w.dataPort, w.keepaliveMs);
-        Serial.printf("[DISC] Server welcomed us: %s port=%u keepalive=%lums\r\n",
-            discovery.serverIP().toString().c_str(),
-            w.dataPort, (unsigned long)w.keepaliveMs);
+    PacketType t = transportPtr->pump(w, k);
+    if (t == PacketType::Welcome && transportPtr->acceptWelcome(w)) {
+        Serial.printf("[DISC] Server accepted us (%s). Entering streaming.\r\n",
+            activeTransport == cfg::TRANSPORT_ESPNOW ? "dongle" : "udp");
+        if (activeTransport == cfg::TRANSPORT_ESPNOW && !deviceCfg.hasPair()
+                && espnowLink.peerMac()) {
+            // First successful pairing: remember MAC + channel for instant
+            // reconnects on later boots.
+            deviceCfg.setPair(espnowLink.peerMac(), espnowLink.channel());
+            Serial.println("[DISC] Dongle paired & remembered ('pair clear' to forget).");
+        }
         lastKeepaliveMs = millis();
         enterState(DeviceState::Streaming);
     }
@@ -230,27 +288,28 @@ static void loopStreaming() {
     // 1) Drain inbound (keepalive / welcome / bye)
     WelcomePacket w;
     KeepalivePacket k;
-    PacketType t = discovery.pump(w, k);
+    PacketType t = transportPtr->pump(w, k);
     if (t == PacketType::Keepalive) {
         lastKeepaliveMs = millis();
     } else if (t == PacketType::Welcome) {
         // server restarted; re-arm
-        discovery.setServer(discovery.serverIP(), w.dataPort, w.keepaliveMs);
+        transportPtr->acceptWelcome(w);
         lastKeepaliveMs = millis();
     }
 
     // 2) Check keepalive timeout -> back to discovery
     if (millis() - lastKeepaliveMs > cfg::KEEPALIVE_TIMEOUT_MS) {
         Serial.println("[DISC] Keepalive timeout. Returning to discovery.");
-        discovery.clearServer();
+        transportPtr->clearServer();
         enterState(DeviceState::Discovering);
         return;
     }
 
-    // 3) Check WiFi drop
-    if (wifi.hadDisconnect() || !wifi.isConnected()) {
+    // 3) Check WiFi drop (UDP mode only)
+    if (activeTransport == cfg::TRANSPORT_WIFI &&
+            (wifi.hadDisconnect() || !wifi.isConnected())) {
         Serial.println("[NET] WiFi dropped. Returning to CONNECTING.");
-        discovery.clearServer();
+        transportPtr->clearServer();
         enterState(DeviceState::Connecting);
         return;
     }
@@ -274,7 +333,7 @@ static void loopStreaming() {
         DataPacket p;
         PacketIO::buildData(p, packetId++, filtered, touch, fdcRaw, sensorType,
                             i2cMs, loopMs, wifi.rssi());
-        discovery.sendData(p);
+        transportPtr->sendData(p);
         lastFrameMs = now;
     } else {
         delay(1);
@@ -296,10 +355,11 @@ void loop() {
         case DeviceState::Streaming:     loopStreaming();   break;
     }
 
-    // Universal WiFi drop detection (catches both CONNECTING and after STREAMING)
-    if (state != DeviceState::Provisioning && wifi.hadDisconnect()) {
+    // Universal WiFi drop detection (UDP transport only)
+    if (activeTransport == cfg::TRANSPORT_WIFI && state != DeviceState::Provisioning &&
+            wifi.hadDisconnect()) {
         Serial.println("[NET] WiFi disconnected by event.");
-        discovery.clearServer();
+        transportPtr->clearServer();
         enterState(DeviceState::Connecting);
     }
 

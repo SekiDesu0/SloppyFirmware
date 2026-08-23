@@ -5,6 +5,7 @@ import math
 import os
 import time
 import threading
+import argparse
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 
@@ -14,6 +15,19 @@ try:
     SERIAL_AVAILABLE = True
 except ImportError:
     SERIAL_AVAILABLE = False
+
+# Optional ESP-NOW dongle ingestion (vendor-defined HID device).
+# Prefer the hidraw backend (plain /dev/hidraw access, no libusb driver
+# detachment games); fall back to the libusb-backed 'hid' module.
+try:
+    import hidraw as hidapi
+    HID_AVAILABLE = True
+except ImportError:
+    try:
+        import hid as hidapi
+        HID_AVAILABLE = True
+    except ImportError:
+        HID_AVAILABLE = False
 
 # Optional SteamVR fusion (right controller only - thumb + index)
 try:
@@ -34,6 +48,7 @@ TYPE_WELCOME   = 2
 TYPE_DATA      = 3
 TYPE_KEEPALIVE = 4
 TYPE_BYE      = 5
+TYPE_TUNNEL    = 6   # dongle -> PC: DATA framed with source MAC + dongle RSSI
 
 SENSOR_NONE    = 0
 SENSOR_MPR121  = 1
@@ -64,9 +79,34 @@ DATA_LEN = struct.calcsize(DATA_FMT)
 # Keepalive: header + lastSeenPacketId(I) = 12
 KEEP_FMT = HEADER_FMT + "I"
 
+# Tunnel (dongle -> PC over HID): header + mac(6s) + rssi(b) + reserved(B),
+# followed by an embedded DATA packet. 16 + 66 = 82 bytes.
+TUNNEL_FMT = HEADER_FMT + "6sbB"
+TUNNEL_HDR_LEN = struct.calcsize(TUNNEL_FMT)
+TUNNEL_LEN = TUNNEL_HDR_LEN + DATA_LEN
+
 HELLO_LEN = struct.calcsize(HELLO_FMT)
 WELCOME_LEN = struct.calcsize(WELCOME_FMT)
 KEEP_LEN = struct.calcsize(KEEP_FMT)
+
+# ---------------------------------------------------------------------------
+# CLI: choose where sensor frames come from
+#   --source udp  classic path, gloves stream straight to this PC over WiFi
+#   --source hid  gloves stream over ESP-NOW to the S3 dongle; this PC reads
+#                 TUNNEL reports from its vendor-defined HID interface
+# ---------------------------------------------------------------------------
+DONGLE_VID_DEFAULT = 0x303A   # Espressif
+DONGLE_PID_DEFAULT = 0x534C   # "SL" - SloppyHands dongle
+
+_argp = argparse.ArgumentParser(description="SloppyHands tracker")
+_argp.add_argument("--source", choices=["udp", "hid"], default="udp",
+                   help="data source: udp (WiFi, default) or hid (ESP-NOW dongle)")
+_argp.add_argument("--vid", type=lambda x: int(x, 0), default=DONGLE_VID_DEFAULT,
+                   help="dongle USB VID (hex ok)")
+_argp.add_argument("--pid", type=lambda x: int(x, 0), default=DONGLE_PID_DEFAULT,
+                   help="dongle USB PID (hex ok)")
+ARGS = _argp.parse_args()
+SOURCE = ARGS.source
 
 
 # ---------------------------------------------------------------------------
@@ -169,13 +209,96 @@ def save_config(cfg):
 
 
 # ---------------------------------------------------------------------------
-# UDP
+# UDP (classic WiFi path) / HID (ESP-NOW dongle path)
 # ---------------------------------------------------------------------------
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind(("0.0.0.0", PORT))
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-sock.setblocking(False)
-print(f"Server listening for HELLO broadcasts on UDP {PORT}")
+sock = None
+hid_dev = None
+_hid_part1 = b""   # reassembly buffer for HID report ID 1 (first 62 bytes)
+
+if SOURCE == "udp":
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", PORT))
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.setblocking(False)
+    print(f"Server listening for HELLO broadcasts on UDP {PORT}")
+else:
+    if not HID_AVAILABLE:
+        raise SystemExit("--source hid requires the 'hid' package:  pip install hidapi")
+    matches = [d for d in hidapi.enumerate(ARGS.vid, ARGS.pid)]
+    if not matches:
+        raise SystemExit(
+            f"No HID device with VID={ARGS.vid:#06x} PID={ARGS.pid:#06x} found.\n"
+            "Is the SloppyHands dongle plugged in? (--vid/--pid to override)")
+
+    class _RawHidShim:
+        """Minimal os-level hidraw reader with hidapi-compatible .read()."""
+        def __init__(self, node):
+            self._fd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+
+        def set_nonblocking(self, flag):
+            pass
+
+        def read(self, n):
+            try:
+                return list(os.read(self._fd, n))
+            except BlockingIOError:
+                return []
+
+        def close(self):
+            os.close(self._fd)
+
+    def _linux_hidraw_node(vid, pid):
+        """Resolve /dev/hidrawN for a USB HID device via sysfs (Linux only)."""
+        import glob
+        for uevent in glob.glob('/sys/class/hidraw/hidraw*/device/uevent'):
+            try:
+                with open(uevent) as f:
+                    for line in f:
+                        if line.startswith("HID_ID="):
+                            parts = line.strip().split("=", 1)[1].split(":")
+                            if len(parts) == 3 and int(parts[1], 16) == vid \
+                                    and int(parts[2], 16) == pid:
+                                # uevent path: .../class/hidraw/hidrawN/device/uevent
+                                node = uevent.split("/")[4]
+                                return f"/dev/{node}"
+                        if line.startswith("DRIVER="):
+                            break
+            except OSError:
+                continue
+        return None
+
+    devnode = ""
+    for m in matches:                       # normal case; works on Windows/macOS
+        try:
+            cand = hidapi.device()
+            cand.open_path(m["path"])
+            hid_dev = cand
+            break
+        except Exception:
+            continue
+    if hid_dev is None and os.path.isdir("/sys/class/hidraw"):
+        devnode = _linux_hidraw_node(ARGS.vid, ARGS.pid) or ""
+        if devnode:
+            try:
+                cand = hidapi.device()
+                cand.open_path(devnode.encode())
+                hid_dev = cand
+            except Exception:
+                pass
+    if hid_dev is not None:
+        print(f"Reading TUNNEL reports from dongle VID={ARGS.vid:#06x} "
+              f"PID={ARGS.pid:#06x} ({matches[0].get('product_string', '?')})")
+    else:
+        # Last resort: bypass hidapi entirely.
+        if not devnode:
+            devnode = _linux_hidraw_node(ARGS.vid, ARGS.pid) or ""
+        if not devnode:
+            raise SystemExit(
+                f"Could not open dongle HID device ({ARGS.vid:#06x}/{ARGS.pid:#06x}). "
+                "Check permissions on the hidraw node.")
+        hid_dev = _RawHidShim(devnode)
+        print(f"(hidapi unusable; reading raw {devnode})")
+    hid_dev.set_nonblocking(1)
 
 
 def mac_bytes_to_str(b):
@@ -241,9 +364,12 @@ class HandState:
             s.reset()
 
     def is_alive(self):
-        return self.ip is not None and (time.time() - self.last_seen) < DEVICE_TIMEOUT_S
+        # HID-path devices have no IP; MAC binding is enough.
+        return self.mac is not None and (time.time() - self.last_seen) < DEVICE_TIMEOUT_S
 
     def send_welcome(self):
+        if SOURCE == "hid":
+            return  # the dongle owns the device-facing link
         if self.ip is None:
             return
         pkt = struct.pack(WELCOME_FMT, MAGIC, TYPE_WELCOME, 3, 0, PORT, int(KEEPALIVE_INTERVAL_S * 1000))
@@ -252,6 +378,8 @@ class HandState:
         print(f"[server] Sent WELCOME to {self.ip}:{self.port} (hand={self.name})")
 
     def send_keepalive(self):
+        if SOURCE == "hid":
+            return  # the dongle owns the device-facing link
         if self.ip is None:
             return
         pkt = struct.pack(KEEP_FMT, MAGIC, TYPE_KEEPALIVE, 3, 0, self.last_packet_id)
@@ -332,7 +460,10 @@ root.geometry("980x820")
 root.configure(bg="#222")
 
 diag_text = tk.StringVar()
-diag_text.set("Waiting for device HELLO broadcasts on UDP 4242...")
+if SOURCE == "hid":
+    diag_text.set(f"Waiting for TUNNEL reports from ESP-NOW dongle (VID={ARGS.vid:#06x} PID={ARGS.pid:#06x})...")
+else:
+    diag_text.set("Waiting for device HELLO broadcasts on UDP 4242...")
 diag_label = tk.Label(root, textvariable=diag_text, bg="#222", fg="#00FF00", font=("Consolas", 10))
 diag_label.pack(fill=tk.X, pady=3)
 
@@ -391,6 +522,7 @@ def assign_hand(mac_str, new_hand):
             hands[new_hand].send_welcome()
         cfg["mac_hand"][mac_str] = new_hand
         pending.pop(mac_str, None)
+        print(f"[assign] {mac_str} -> {new_hand}")
     else:
         # auto: keep in pending
         if captured_ip is not None:
@@ -1118,6 +1250,114 @@ left_view.set_skeleton_visible(False)
 # ---------------------------------------------------------------------------
 # Packet handling
 # ---------------------------------------------------------------------------
+def parse_data_fields(data):
+    """Unpack a DATA packet (v4 fw, or legacy v3). Returns a tuple
+    (packet_id, uptime, filtered, touch, fdc_raw, sensor_type,
+     i2c_ms, loop_ms, rssi) or None if malformed."""
+    if len(data) >= DATA_LEN:
+        fields = struct.unpack(DATA_FMT, data[:DATA_LEN])
+        return (
+            fields[4], fields[5],
+            list(fields[6:18]), fields[18], list(fields[19:23]),
+            fields[23], fields[25], fields[26], fields[27],
+        )
+    if len(data) >= DATA_LEN_V3:
+        fields = struct.unpack(DATA_FMT_V3, data[:DATA_LEN_V3])
+        return (
+            fields[4], fields[5],
+            list(fields[6:18]), fields[18], [0, 0, 0, 0],
+            SENSOR_MPR121, fields[19], fields[20], fields[21],
+        )
+    return None
+
+
+def deliver_data_mac(mac_str, parsed, dongle_rssi=None, fw=0):
+    """HID path: route a parsed DATA frame to its hand slot by MAC,
+    registering/auto-assigning unknown devices along the way."""
+    target = None
+    for h in ("left", "right"):
+        if hands[h].mac == mac_str:
+            target = hands[h]
+            break
+
+    if target is None:
+        # Unknown MAC: honor persisted preference, else first free slot.
+        pref = cfg["mac_hand"].get(mac_str)
+        slot = pref if pref in ("left", "right") else None
+        if slot is None:
+            for h in ("left", "right"):
+                if hands[h].mac is None:
+                    slot = h
+                    break
+        if slot is not None:
+            assign_hand(mac_str, slot)
+            for h in ("left", "right"):
+                if hands[h].mac == mac_str:
+                    target = hands[h]
+                    break
+        else:
+            # both slots busy: keep visible as pending
+            pending[mac_str] = {
+                "ip": "(dongle)", "fw": fw,
+                "channel_count": 12, "hand_hint": HAND_UNKNOWN,
+                "last_seen": time.time(),
+            }
+
+    if target is None:
+        return
+    packet_id, uptime, filtered, touch, fdc_raw, sensor_type, i2c_ms, loop_ms, rssi = parsed
+    if dongle_rssi:                       # prefer the dongle's measurement
+        rssi = dongle_rssi
+    if not target.fw:
+        target.fw = fw
+    target.filtered = filtered
+    target.touch = touch
+    target.fdc_raw = fdc_raw
+    target.sensor_type = sensor_type
+    target.meta = {"i2c_ms": i2c_ms, "loop_ms": loop_ms, "rssi": rssi, "uptime": uptime}
+    target.last_seen = time.time()
+    if packet_id > target.last_packet_id:
+        target.last_packet_id = packet_id
+
+
+def ingest_hid_reports():
+    """Drain TUNNEL input reports from the ESP-NOW dongle (non-blocking).
+
+    The 82-byte TunnelPacket arrives split across two HID report IDs
+    (ID1: first 64 bytes, ID2: remaining 18). hidapi/hidraw prefix each
+    read with the report-id byte; reassemble before parsing.
+    """
+    global _hid_part1
+    while True:
+        report = hid_dev.read(96)   # [] when empty; len = 65 or 19 with ID byte
+        if not report:
+            break
+        if not isinstance(report, (bytes, bytearray)):
+            report = bytes(report)
+        else:
+            report = bytes(report)
+        if len(report) < 2:
+            continue
+        rid = report[0]
+        payload = report[1:]
+        if rid == 1:
+            _hid_part1 = payload[:62]
+        elif rid == 2 and len(_hid_part1) == 62 and len(payload) == TUNNEL_LEN - 62:
+            data = _hid_part1 + payload
+            _hid_part1 = b""
+            if len(data) < TUNNEL_HDR_LEN:
+                continue
+            magic, ptype, fw, _r, mac_bytes, dongle_rssi, _resv = struct.unpack(
+                TUNNEL_FMT, data[:TUNNEL_HDR_LEN])
+            if magic != MAGIC or ptype != TYPE_TUNNEL:
+                continue
+            mac_str = mac_bytes_to_str(mac_bytes)
+            parsed = parse_data_fields(data[TUNNEL_HDR_LEN:])
+            if parsed is None:
+                continue
+            deliver_data_mac(mac_str, parsed, dongle_rssi=dongle_rssi, fw=fw)
+
+
 def handle_packet(data, addr):
     if len(data) < struct.calcsize(HEADER_FMT):
         return
@@ -1165,30 +1405,10 @@ def handle_packet(data, addr):
         rebuild_device_list()
 
     elif ptype == TYPE_DATA:
-        if fw >= 4 and len(data) >= DATA_LEN:
-            fields = struct.unpack(DATA_FMT, data[:DATA_LEN])
-            packet_id   = fields[4]
-            uptime      = fields[5]
-            filtered    = list(fields[6:18])
-            touch       = fields[18]
-            fdc_raw     = list(fields[19:23])
-            sensor_type = fields[23]
-            i2c_ms      = fields[25]
-            loop_ms     = fields[26]
-            rssi        = fields[27]
-        elif len(data) >= DATA_LEN_V3:
-            fields = struct.unpack(DATA_FMT_V3, data[:DATA_LEN_V3])
-            packet_id   = fields[4]
-            uptime      = fields[5]
-            filtered    = list(fields[6:18])
-            touch       = fields[18]
-            fdc_raw     = [0, 0, 0, 0]
-            sensor_type = SENSOR_MPR121
-            i2c_ms      = fields[19]
-            loop_ms     = fields[20]
-            rssi        = fields[21]
-        else:
+        parsed = parse_data_fields(data)
+        if parsed is None:
             return
+        packet_id, uptime, filtered, touch, fdc_raw, sensor_type, i2c_ms, loop_ms, rssi = parsed
         # find which hand slot owns the sender by ip
         target = None
         for h in ("left", "right"):
@@ -1229,30 +1449,36 @@ def handle_packet(data, addr):
 
 
 def update_gui():
-    # 1) drain UDP
-    while True:
-        try:
-            raw_bytes, addr = sock.recvfrom(1024)
-        except (BlockingIOError, OSError):
-            break
-        handle_packet(raw_bytes, addr)
+    # 1) drain inbound frames from the active source
+    if SOURCE == "hid":
+        ingest_hid_reports()
+    else:
+        while True:
+            try:
+                raw_bytes, addr = sock.recvfrom(1024)
+            except (BlockingIOError, OSError):
+                break
+            handle_packet(raw_bytes, addr)
 
     _fdc_cal_tick()
 
-    # 2) sweep dead sessions: a hand that went silent gets unbound so HELLO can re-handshake
-    for h in ("left", "right"):
-        hs = hands[h]
-        if hs.mac is not None and not hs.is_alive():
-            print(f"[server] {h} hand ({hs.mac} @ {hs.ip}) went silent; unbinding.")
-            pending[hs.mac] = {"ip": hs.ip, "fw": hs.fw, "last_seen": time.time(),
-                               "channel_count": 12, "hand_hint": HAND_UNKNOWN}
-            cfg["mac_hand"].pop(hs.mac, None)
-            save_config(cfg)
-            hs.mac = None
-            hs.ip = None
-            hs.reset_stream_state()
-            global _last_known_macs
-            _last_known_macs = set()  # force rebuild next pass
+    # 2) sweep dead sessions (UDP only: HELLO re-handshake restores them).
+    # In HID mode the dongle owns device-side liveness, so we never unbind
+    # here - that would wipe persisted MAC -> hand mappings.
+    if SOURCE == "udp":
+        for h in ("left", "right"):
+            hs = hands[h]
+            if hs.mac is not None and not hs.is_alive():
+                print(f"[server] {h} hand ({hs.mac} @ {hs.ip}) went silent; unbinding.")
+                pending[hs.mac] = {"ip": hs.ip, "fw": hs.fw, "last_seen": time.time(),
+                                   "channel_count": 12, "hand_hint": HAND_UNKNOWN}
+                cfg["mac_hand"].pop(hs.mac, None)
+                save_config(cfg)
+                hs.mac = None
+                hs.ip = None
+                hs.reset_stream_state()
+                global _last_known_macs
+                _last_known_macs = set()  # force rebuild next pass
     # also drop stale pending entries
     now = time.time()
     for mac in list(pending.keys()):
@@ -1306,7 +1532,8 @@ def on_closing():
             openvr.shutdown()
     except Exception:
         pass
-    sock.close()
+    if sock:
+        sock.close()
     root.destroy()
 
 

@@ -43,6 +43,14 @@ bool PacketIO::isHeaderValid(const Header& h, PacketType expected) {
     return h.magic == cfg::MAGIC && h.type == static_cast<uint8_t>(expected);
 }
 
+void PacketIO::buildTunnel(TunnelPacket& t, const uint8_t mac[6], int8_t rssi, const DataPacket& d) {
+    initHeader(t.h, PacketType::Tunnel);
+    memcpy(t.mac, mac, 6);
+    t.rssi     = rssi;
+    t.reserved = 0;
+    t.data     = d;
+}
+
 bool PacketIO::parseWelcome(const uint8_t* buf, size_t len, WelcomePacket& out) {
     if (len < sizeof(WelcomePacket)) return false;
     memcpy(&out, buf, sizeof(WelcomePacket));
@@ -53,4 +61,10 @@ bool PacketIO::parseKeepalive(const uint8_t* buf, size_t len, KeepalivePacket& o
     if (len < sizeof(KeepalivePacket)) return false;
     memcpy(&out, buf, sizeof(KeepalivePacket));
     return isHeaderValid(out.h, PacketType::Keepalive);
+}
+
+bool PacketIO::parseTunnel(const uint8_t* buf, size_t len, TunnelPacket& out) {
+    if (len < sizeof(TunnelPacket)) return false;
+    memcpy(&out, buf, sizeof(TunnelPacket));
+    return isHeaderValid(out.h, PacketType::Tunnel);
 }
