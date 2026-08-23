@@ -46,6 +46,57 @@ works — the dongle keeps a peer table (`ESPNOW_MAX_PEERS`, default 8).
   channel-hopping discovery finds the dongle, remembers its MAC/channel, then
   streams DATA unicasts. See "Dongle firmware" below.
 
+## Building & flashing the glove firmware
+
+Prerequisites: [PlatformIO](https://docs.platformio.org/en/latest/core/installation.html)
+(`pip install platformio` or the VS Code extension). No extra setup needed —
+library versions are resolved from `platformio.ini` on first build.
+
+Pick the environment matching your board:
+
+| Board | PlatformIO env | Notes |
+|-------|----------------|-------|
+| ESP32-S3 DevKitC-1 / SuperMini | `esp32-s3-devkitc-1` | built-in WS2812 on GPIO48 |
+| NodeMCU (ESP8266)              | `esp8266-nodemcuv2`  | needs external NeoPixel |
+| Wemos D1 Mini (ESP8266)        | `d1_mini`            | needs external NeoPixel |
+
+Compile and upload (plug the board in via USB; `PORT` is optional — PlatformIO
+auto-detects):
+
+```sh
+# NodeMCU
+pio run -e esp8266-nodemcuv2 -t upload            # add --upload-port COM5 (Windows) or /dev/ttyUSB0 (Linux)
+
+# Wemos D1 Mini
+pio run -e d1_mini -t upload
+
+# ESP32-S3 glove
+pio run -e esp32-s3-devkitc-1 -t upload
+```
+
+Then open the serial console to provision (`Ctrl+T`, `Ctrl+T`, `Ctrl+H` style
+hotkeys are not needed — just type):
+
+```sh
+pio device monitor -e esp8266-nodemcuv2 -b 115200   # same for d1_mini / esp32-s3-devkitc-1
+```
+
+On first boot the LED pulses blue waiting for provisioning. For the WiFi/UDP
+transport run `wifi set <ssid> <pass>`; for the dongle path just leave the
+default (`transport espnow`) — no credentials needed.
+
+### ESP8266 wiring (NodeMCU / D1 Mini)
+
+| Signal   | NodeMCU label | D1 Mini label | GPIO     |
+|----------|---------------|---------------|----------|
+| I2C SDA  | D2            | D2            | GPIO4    |
+| I2C SCL  | D1            | D1            | GPIO5    |
+| NeoPixel | D6            | D6            | GPIO12   |
+
+The NeoPixel data line must be an **external** WS2812 chain on GPIO12 — the
+on-board LED of these boards is a plain GPIO LED, not addressable. Pins live in
+`include/config.h` if your wiring differs.
+
 ## Dongle firmware (`env:esp32s3-dongle`)
 
 A separate firmware image for an ESP32-S3 board that plugs into the PC:

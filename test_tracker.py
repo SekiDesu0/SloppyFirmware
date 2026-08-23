@@ -472,10 +472,47 @@ dev_frame = tk.LabelFrame(root, text="Discovered devices", bg="#222", fg="#FFAA0
                           font=("Consolas", 10, "bold"), padx=6, pady=4)
 dev_frame.pack(fill=tk.X, padx=10, pady=4)
 
-tk.Label(dev_frame, text="MAC                IP            FW  Ch  Hand     RSSI  Last",
-        bg="#222", fg="#888", font=("Consolas", 9)).grid(row=0, column=0, sticky="w")
-dev_rows = {}  # mac -> {"row": int, "widgets": {...}}
-dev_row_var = {}  # mac -> StringVar for hand combobox
+# Device list: a proper table. Column alignment is handled by the widget
+# itself (per-column anchors), so ESP-NOW devices without an IP no longer
+# shift anything around.
+_dev_style = ttk.Style()
+_dev_style.configure("Treeview", background="#222", fieldbackground="#222",
+                     foreground="#00FF00", rowheight=20, borderwidth=0,
+                     font=("Consolas", 9))
+_dev_style.configure("Treeview.Heading", background="#222", foreground="#888",
+                     borderwidth=0, font=("Consolas", 9, "bold"))
+_dev_style.map("Treeview", background=[("selected", "#333")],
+               foreground=[("selected", "#00FF00")])
+_dev_style.map("Treeview.Heading", background=[("active", "#222")])
+
+dev_tree = ttk.Treeview(
+    dev_frame, columns=("mac", "ip", "fw", "ch", "hand", "rssi", "last"),
+    show="headings", height=4, selectmode="none")
+for _key, _txt, _w, _anchor in (
+        ("mac", "MAC", 140, "w"), ("ip", "IP", 120, "w"),
+        ("fw", "FW", 45, "w"), ("ch", "Ch", 40, "w"),
+        ("hand", "Hand", 75, "center"), ("rssi", "RSSI", 80, "w"),
+        ("last", "Last", 65, "w")):
+    dev_tree.heading(_key, text=_txt, anchor=_anchor)
+    dev_tree.column(_key, width=_w, minwidth=_w, anchor=_anchor, stretch=False)
+dev_tree.pack(fill=tk.X)
+
+
+def _on_dev_tree_click(event):
+    """Clicking the Hand cell cycles the assignment auto -> left -> right."""
+    if dev_tree.identify_region(event.x, event.y) != "cell":
+        return
+    item = dev_tree.identify_row(event.y)
+    col = dev_tree.identify_column(event.x)
+    if not item or col != "#5":          # hand column (1-indexed)
+        return
+    order = ["auto", "left", "right"]
+    cur = dev_tree.set(item, "hand")
+    nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else "left"
+    assign_hand(item, nxt)               # iid == mac
+
+
+dev_tree.bind("<Button-1>", _on_dev_tree_click)
 
 
 def assign_hand(mac_str, new_hand):
@@ -544,8 +581,8 @@ _last_known_macs = set()
 
 
 def rebuild_device_list():
-    """Rebuild widget rows ONLY when the set of MACs changes. Cheap to call
-    every frame: it diffs and exits early when nothing structural changed."""
+    """Sync the Treeview with the known device set ONLY when it changes.
+    Cheap to call every frame: diffs and exits early when nothing changed."""
     global _last_known_macs
     all_macs = set(pending.keys()) | {hands[h].mac for h in hands if hands[h].mac}
     all_macs.discard(None)
@@ -553,92 +590,53 @@ def rebuild_device_list():
         return  # nothing to rebuild
     _last_known_macs = set(all_macs)
 
-    # destroy rows no longer needed
-    for mac in list(dev_rows.keys()):
-        if mac not in all_macs:
-            dev_rows[mac]["widgets"]["frame"].destroy()
-            del dev_rows[mac]
-            dev_row_var.pop(mac, None)
-    # create missing rows
-    r = 1
-    for mac in sorted(all_macs):
-        if mac not in dev_rows:
-            row_frame = tk.Frame(dev_frame, bg="#222")
-            row_frame.grid(row=r, column=0, sticky="w")
-            var = tk.StringVar(value="auto")
-            cb = ttk.Combobox(row_frame, textvariable=var, values=["auto", "left", "right"],
-                              width=6, state="readonly")
-            dev_row_var[mac] = var
-            widgets = {
-                "frame": row_frame,
-                "hand": cb,
-            }
-            for col, key in enumerate(["mac", "ip", "fw", "ch", "hand", "rssi", "last"]):
-                if key == "hand":
-                    cb.grid(row=0, column=col, padx=4)
-                else:
-                    widgets[key] = tk.Label(row_frame, text="", bg="#222", fg="#00FF00",
-                                             font=("Consolas", 9))
-                    widgets[key].grid(row=0, column=col, padx=4, sticky="w")
-            widgets["mac"].configure(text=mac)
-            # Hook up assignment AFTER widgets exist so the trace doesn't fire
-            # for the initial "auto".
-            var.trace_add("write", lambda *a, _m=mac, _v=var: assign_hand(_m, _v.get()))
-            dev_rows[mac] = {"row": r, "widgets": widgets}
-        else:
-            dev_rows[mac]["row"] = r
-            dev_rows[mac]["widgets"]["frame"].grid(row=r, column=0, sticky="w")
-        r += 1
+    existing = set(dev_tree.get_children())
+    for mac in existing - all_macs:
+        dev_tree.delete(mac)
+    for mac in sorted(all_macs - existing):
+        # iid == mac so lookups are direct; values refreshed per-frame
+        dev_tree.insert("", "end", iid=mac,
+                        values=(mac, "", "", "", "auto", "-", "-"))
+    for i, mac in enumerate(sorted(all_macs)):
+        dev_tree.move(mac, "", i)
+    # fit the table to its contents so there's no dead space below
+    dev_tree.configure(height=max(1, len(all_macs)))
 
 
 def refresh_device_values():
-    """Per-frame cheap update of label text + hand combobox. Does NOT touch
-    widget structure and does NOT clobber an in-progress hand edit."""
+    """Per-frame cheap update of table cell values."""
     now = time.time()
-    for mac, row in dev_rows.items():
-        w = row["widgets"]
+    for mac in dev_tree.get_children():
         # find current assignment
-        cur = "auto"
+        cur = None
         for h in ("left", "right"):
             if hands[h].mac == mac:
                 cur = h
                 break
+        hand_state = hands[cur] if cur else None
         info = pending.get(mac)
-        hand_state = hands[cur] if cur in ("left", "right") else None
-        # ip
         if info is not None:
-            w["ip"].configure(text=info["ip"])
-            w["fw"].configure(text=str(info["fw"]))
-            w["ch"].configure(text=str(info["channel_count"]))
+            ip_txt = info["ip"] or "(dongle)"   # ESP-NOW: no IP
+            fw_txt = str(info["fw"])
+            ch_txt = str(info["channel_count"])
             elapsed = now - info["last_seen"]
         elif hand_state is not None and hand_state.is_alive():
-            w["ip"].configure(text=hand_state.ip)
-            w["fw"].configure(text=str(hand_state.fw))
-            ch_count = 4 if hand_state.sensor_type == SENSOR_FDC2214 else 12
-            w["ch"].configure(text=str(ch_count))
+            ip_txt = hand_state.ip or "(dongle)"
+            fw_txt = str(hand_state.fw)
+            ch_txt = "4" if hand_state.sensor_type == SENSOR_FDC2214 else "12"
             elapsed = now - hand_state.last_seen
         else:
-            w["ip"].configure(text="?")
-            w["fw"].configure(text="?")
-            w["ch"].configure(text="?")
-            elapsed = 0
-        # rssi/last from the hand_state if alive
+            ip_txt, fw_txt, ch_txt, elapsed = "?", "?", "?", 0
         if hand_state is not None and hand_state.is_alive():
-            w["rssi"].configure(text=f"{hand_state.meta['rssi']}dBm")
+            rssi_txt = f"{hand_state.meta['rssi']}dBm"
         else:
-            w["rssi"].configure(text="-")
-        w["last"].configure(text=f"{elapsed:0.1f}s")
-        # Only update combobox if different AND only when not actively being
-        # edited (combobox has focus). This stops us fighting the user.
-        cb_var = dev_row_var.get(mac)
-        if cb_var is not None and cur != cb_var.get():
-            try:
-                focused = root.focus_get()
-                w["hand"]  # may be None briefly
-                if focused is not w["hand"]:
-                    cb_var.set(cur)
-            except Exception:
-                pass
+            rssi_txt = "-"
+        dev_tree.set(mac, "ip", ip_txt)
+        dev_tree.set(mac, "fw", fw_txt)
+        dev_tree.set(mac, "ch", ch_txt)
+        dev_tree.set(mac, "hand", cur or "auto")
+        dev_tree.set(mac, "rssi", rssi_txt)
+        dev_tree.set(mac, "last", f"{elapsed:0.1f}s")
 
 
 # --- Canvases for the two hands side by side ---
