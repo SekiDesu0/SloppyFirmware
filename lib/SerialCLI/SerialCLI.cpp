@@ -1,10 +1,13 @@
 #include "SerialCLI.h"
+#include "config.h"
 
-void SerialCLI::begin(StatusFn statusFn, WifiSetFn wifiSetFn, WifiClearFn wifiClearFn, HandSetFn handSetFn) {
+void SerialCLI::begin(StatusFn statusFn, WifiSetFn wifiSetFn, WifiClearFn wifiClearFn,
+                      HandSetFn handSetFn, SensorSetFn sensorSetFn) {
     _statusFn    = statusFn;
     _wifiSetFn   = wifiSetFn;
     _wifiClearFn = wifiClearFn;
     _handSetFn   = handSetFn;
+    _sensorSetFn = sensorSetFn;
     _started = true;
     Serial.println();
     Serial.println("SloppyFirmware v3 - serial CLI ready.");
@@ -42,6 +45,9 @@ void SerialCLI::_help() {
     Serial.println("  hand left                 Mark this device as the LEFT hand");
     Serial.println("  hand right                Mark this device as the RIGHT hand");
     Serial.println("  hand auto                 Clear hand assignment (unknown)");
+    Serial.println("  sensor auto               Auto-detect sensor (FDC2214 then MPR121)");
+    Serial.println("  sensor mpr121             Force MPR121 sensor");
+    Serial.println("  sensor fdc2214            Force FDC2214 sensor");
     Serial.println("  status                   Print device diagnostics");
     Serial.println("  reset                    Soft-reset the device");
     Serial.println("  help                     Show this message");
@@ -67,6 +73,23 @@ void SerialCLI::_exec(const String& line) {
         if (_handSetFn) _handSetFn(h);
         Serial.printf("Hand set to %s. Will be included in next HELLO.\r\n",
             h == 1 ? "left" : (h == 2 ? "right" : "unknown"));
+        return;
+    }
+
+    if (t.startsWith("sensor ")) {
+        String arg = t.substring(7);
+        arg.trim();
+        uint8_t m;
+        if (arg == "auto")             m = cfg::SENSOR_MODE_AUTO;
+        else if (arg == "mpr121")      m = cfg::SENSOR_MODE_MPR121;
+        else if (arg == "fdc2214")     m = cfg::SENSOR_MODE_FDC2214;
+        else { Serial.println("Usage: sensor auto | sensor mpr121 | sensor fdc2214"); return; }
+        if (_sensorSetFn) _sensorSetFn(m);
+        Serial.printf("Sensor set to %s. Rebooting...\r\n",
+            m == cfg::SENSOR_MODE_MPR121 ? "mpr121" :
+            m == cfg::SENSOR_MODE_FDC2214 ? "fdc2214" : "auto");
+        delay(200);
+        ESP.restart();
         return;
     }
 

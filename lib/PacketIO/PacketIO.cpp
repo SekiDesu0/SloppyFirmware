@@ -23,16 +23,20 @@ void PacketIO::buildHello(HelloPacket& p, const uint8_t mac[6], uint8_t hand) {
 
 void PacketIO::buildData(DataPacket& p, uint32_t packetId,
                          const uint16_t filtered[12], uint16_t touch,
+                         const uint32_t fdcRaw[4], uint8_t sensorType,
                          uint16_t i2cMs, uint16_t loopMs, int8_t rssi) {
     initHeader(p.h, PacketType::Data);
     p.packetId        = packetId;
     p.uptimeMs        = millis();
     memcpy(p.filtered, filtered, sizeof(p.filtered));
     p.touchStatus     = touch;
+    memcpy(p.fdcRaw, fdcRaw, sizeof(p.fdcRaw));
+    p.sensorType      = sensorType;
+    p.reserved2       = 0;
     p.i2cReadTimeMs   = i2cMs;
     p.totalLoopTimeMs = loopMs;
     p.wifiRssi        = rssi;
-    p.reserved2       = 0;
+    p.reserved3       = 0;
 }
 
 bool PacketIO::isHeaderValid(const Header& h, PacketType expected) {

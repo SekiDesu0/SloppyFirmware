@@ -9,7 +9,9 @@ public:
     using WifiSetFn = bool (*)(const String& ssid, const String& pass);
     using WifiClearFn = void (*)();
     using HandSetFn  = void (*)(uint8_t hand);
-    void begin(StatusFn statusFn, WifiSetFn wifiSetFn, WifiClearFn wifiClearFn, HandSetFn handSetFn);
+    using SensorSetFn = void (*)(uint8_t mode);
+    void begin(StatusFn statusFn, WifiSetFn wifiSetFn, WifiClearFn wifiClearFn,
+               HandSetFn handSetFn, SensorSetFn sensorSetFn);
     void update();
 
 private:
@@ -18,6 +20,7 @@ private:
     WifiSetFn     _wifiSetFn  = nullptr;
     WifiClearFn   _wifiClearFn = nullptr;
     HandSetFn     _handSetFn  = nullptr;
+    SensorSetFn   _sensorSetFn = nullptr;
     bool _started = false;
 
     void _help();

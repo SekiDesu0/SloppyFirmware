@@ -50,12 +50,15 @@ struct __attribute__((packed)) DataPacket {
     Header   h;
     uint32_t packetId;
     uint32_t uptimeMs;
-    uint16_t filtered[12];
-    uint16_t touchStatus;
+    uint16_t filtered[12];     // MPR121 filtered values (zero when inactive)
+    uint16_t touchStatus;      // MPR121 touch bitmask
+    uint32_t fdcRaw[4];        // FDC2214 28-bit raw (zero when inactive)
+    uint8_t  sensorType;       // 0=none, 1=MPR121, 2=FDC2214
+    uint8_t  reserved2;
     uint16_t i2cReadTimeMs;
     uint16_t totalLoopTimeMs;
     int8_t   wifiRssi;
-    uint8_t  reserved2;
+    uint8_t  reserved3;
 };
 
 struct __attribute__((packed)) KeepalivePacket {
@@ -68,6 +71,7 @@ namespace PacketIO {
     void buildHello(HelloPacket& p, const uint8_t mac[6], uint8_t hand);
     void buildData(DataPacket& p, uint32_t packetId,
                    const uint16_t filtered[12], uint16_t touch,
+                   const uint32_t fdcRaw[4], uint8_t sensorType,
                    uint16_t i2cMs, uint16_t loopMs, int8_t rssi);
 
     bool parseWelcome(const uint8_t* buf, size_t len, WelcomePacket& out);

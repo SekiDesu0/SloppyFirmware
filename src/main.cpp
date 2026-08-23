@@ -20,6 +20,7 @@ static constexpr unsigned long CPU_FREQ_MHZ = 80;
 #include "WifiManager.h"
 #include "SerialCLI.h"
 #include "SensorMPR121.h"
+#include "SensorFDC2214.h"
 #include "Discovery.h"
 #include "PacketIO.h"
 #include "DeviceConfig.h"
@@ -27,6 +28,7 @@ static constexpr unsigned long CPU_FREQ_MHZ = 80;
 // --- Globals (externs for SerialCLI callbacks) ------------------------------
 WifiManager   wifi;
 SensorMPR121  sensor;
+SensorFDC2214 fdcSensor;
 StatusLED     led;
 Discovery     discovery;
 SerialCLI     cli;
@@ -38,6 +40,7 @@ uint32_t      lastHelloMs     = 0;
 uint32_t      lastFrameMs    = 0;
 uint32_t      lastKeepaliveMs = 0;
 uint32_t      stateEnterMs   = 0;
+uint8_t       sensorType     = cfg::SENSOR_TYPE_NONE;
 
 // --- CLI callbacks ----------------------------------------------------------
 static void cb_status() {
@@ -50,10 +53,12 @@ static void cb_status() {
         (unsigned long)(millis() / 1000),
         (unsigned long)packetId);
     Serial.println(wifi.statusLine());
-    Serial.printf("hand=%s sensor=%s channels=%u\r\n",
+    Serial.printf("hand=%s sensorMode=%s sensorType=%s channels=%u\r\n",
         deviceCfg.handString(),
-        sensor.present() ? "ok" : "absent",
-        cfg::CHANNEL_COUNT);
+        deviceCfg.sensorModeString(),
+        sensorType == cfg::SENSOR_TYPE_MPR121  ? "mpr121" :
+        sensorType == cfg::SENSOR_TYPE_FDC2214 ? "fdc2214" : "none",
+        sensorType == cfg::SENSOR_TYPE_FDC2214 ? cfg::FDC_CHANNEL_COUNT : cfg::CHANNEL_COUNT);
     if (discovery.hasServer()) {
         Serial.printf("server=%s:%u keepaliveMs=%lu lastKeepaliveAgo=%lums\r\n",
             discovery.serverIP().toString().c_str(),
@@ -74,6 +79,10 @@ static void cb_wifiClear() {
 
 static void cb_handSet(uint8_t h) {
     deviceCfg.setHand(h);
+}
+
+static void cb_sensorSet(uint8_t mode) {
+    deviceCfg.setSensorMode(mode);
 }
 
 // --- Helpers ----------------------------------------------------------------
@@ -113,22 +122,43 @@ void setup() {
 
     watchdogInit();
 
-    bool sensorOk = sensor.begin(cfg::MPR121_ADDR,
-                                 cfg::I2C_SDA, cfg::I2C_SCL,
-                                 cfg::I2C_CLOCK_HZ);
-    if (!sensorOk) {
-        Serial.printf("[BOOT] MPR121 not found at 0x%02X. Proceeding without sensor (server will get empty frames).\r\n",
-            cfg::MPR121_ADDR);
-    } else {
-        Serial.println("[BOOT] MPR121 initialized (12 channels).");
-    }
-    led.setSensorAbsent(!sensorOk);
-
     deviceCfg.begin();
     Serial.printf("[BOOT] Hand assignment: %s (use serial 'hand left|right|auto' to change)\r\n",
         deviceCfg.handString());
+    Serial.printf("[BOOT] Sensor mode: %s (use serial 'sensor auto|mpr121|fdc2214' to change)\r\n",
+        deviceCfg.sensorModeString());
 
-    cli.begin(cb_status, cb_wifiSet, cb_wifiClear, cb_handSet);
+    uint8_t mode = deviceCfg.getSensorMode();
+    bool mprOk = false;
+    bool fdcOk = false;
+
+    if (mode == cfg::SENSOR_MODE_FDC2214) {
+        fdcOk = fdcSensor.begin(cfg::I2C_SDA, cfg::I2C_SCL, cfg::I2C_CLOCK_HZ);
+        sensorType = fdcOk ? cfg::SENSOR_TYPE_FDC2214 : cfg::SENSOR_TYPE_NONE;
+    } else if (mode == cfg::SENSOR_MODE_MPR121) {
+        mprOk = sensor.begin(cfg::MPR121_ADDR, cfg::I2C_SDA, cfg::I2C_SCL, cfg::I2C_CLOCK_HZ);
+        sensorType = mprOk ? cfg::SENSOR_TYPE_MPR121 : cfg::SENSOR_TYPE_NONE;
+    } else {
+        // auto: probe FDC2214 first (higher resolution), fall back to MPR121
+        fdcOk = fdcSensor.begin(cfg::I2C_SDA, cfg::I2C_SCL, cfg::I2C_CLOCK_HZ);
+        if (fdcOk) {
+            sensorType = cfg::SENSOR_TYPE_FDC2214;
+        } else {
+            mprOk = sensor.begin(cfg::MPR121_ADDR, cfg::I2C_SDA, cfg::I2C_SCL, cfg::I2C_CLOCK_HZ);
+            sensorType = mprOk ? cfg::SENSOR_TYPE_MPR121 : cfg::SENSOR_TYPE_NONE;
+        }
+    }
+
+    if (sensorType == cfg::SENSOR_TYPE_NONE) {
+        Serial.println("[BOOT] No sensor found. Proceeding without sensor (server will get empty frames).");
+    } else if (sensorType == cfg::SENSOR_TYPE_FDC2214) {
+        Serial.println("[BOOT] FDC2214 initialized (4 channels).");
+    } else {
+        Serial.println("[BOOT] MPR121 initialized (12 channels).");
+    }
+    led.setSensorAbsent(sensorType == cfg::SENSOR_TYPE_NONE);
+
+    cli.begin(cb_status, cb_wifiSet, cb_wifiClear, cb_handSet, cb_sensorSet);
 
     if (wifi.hasCredentials()) {
         String ssid, pass;
@@ -231,15 +261,18 @@ static void loopStreaming() {
         unsigned long loopStart = millis();
         uint16_t filtered[12] = {0};
         uint16_t touch = 0;
+        uint32_t fdcRaw[4] = {0};
         uint16_t i2cMs = 0;
-        if (sensor.present()) {
-            unsigned long i2cStart = millis();
+        unsigned long i2cStart = millis();
+        if (sensorType == cfg::SENSOR_TYPE_MPR121 && sensor.present()) {
             touch = sensor.readAll(filtered);
-            i2cMs = (uint16_t)(millis() - i2cStart);
+        } else if (sensorType == cfg::SENSOR_TYPE_FDC2214 && fdcSensor.present()) {
+            fdcSensor.readAll(fdcRaw);
         }
+        i2cMs = (uint16_t)(millis() - i2cStart);
         uint16_t loopMs = (uint16_t)(millis() - loopStart);
         DataPacket p;
-        PacketIO::buildData(p, packetId++, filtered, touch,
+        PacketIO::buildData(p, packetId++, filtered, touch, fdcRaw, sensorType,
                             i2cMs, loopMs, wifi.rssi());
         discovery.sendData(p);
         lastFrameMs = now;

@@ -35,10 +35,15 @@ TYPE_DATA      = 3
 TYPE_KEEPALIVE = 4
 TYPE_BYE      = 5
 
+SENSOR_NONE    = 0
+SENSOR_MPR121  = 1
+SENSOR_FDC2214 = 2
+
 HAND_UNKNOWN = 0
 HAND_LEFT    = 1
 HAND_RIGHT   = 2
 HAND_LABELS  = {HAND_UNKNOWN: "auto", HAND_LEFT: "left", HAND_RIGHT: "right"}
+SENSOR_LABELS = {SENSOR_NONE: "none", SENSOR_MPR121: "mpr121", SENSOR_FDC2214: "fdc2214"}
 
 KEEPALIVE_INTERVAL_S = 1.0
 DEVICE_TIMEOUT_S     = 5.0
@@ -49,8 +54,12 @@ HEADER_FMT = "<IBBH"
 HELLO_FMT = HEADER_FMT + "6sBBBB"
 # Welcome: header + dataPort(H) + keepaliveMs(H) = 12
 WELCOME_FMT = HEADER_FMT + "HH"
-# Data: header + packetId(I) uptime(I) filtered(12H) touch(H) i2c(H) loop(H) rssi(b) reserved(B) = 48
-DATA_FMT = HEADER_FMT + "II12HHHHbB"
+# Data (v3, fw<4): header + packetId(I) uptime(I) filtered(12H) touch(H) i2c(H) loop(H) rssi(b) reserved(B) = 48
+DATA_FMT_V3 = HEADER_FMT + "II12HHHHbB"
+DATA_LEN_V3 = struct.calcsize(DATA_FMT_V3)
+# Data (v4, fw>=4): header + packetId(I) uptime(I) filtered(12H) touch(H) fdcRaw(4I)
+#                    sensorType(B) reserved2(B) i2c(H) loop(H) rssi(b) reserved3(B) = 66
+DATA_FMT = HEADER_FMT + "II12HH4IBBHHbB"
 DATA_LEN = struct.calcsize(DATA_FMT)
 # Keepalive: header + lastSeenPacketId(I) = 12
 KEEP_FMT = HEADER_FMT + "I"
@@ -82,6 +91,17 @@ JOINT_KEYS = [
 DEFAULT_MAP_RIGHT = {k: i for i, (k, _) in enumerate(JOINT_KEYS[:6])}  # mid/ring/pinky only
 DEFAULT_MAP_LEFT  = {k: (i if i < 12 else None) for i, (k, _) in enumerate(JOINT_KEYS)}
 
+# FDC2214: 4 channels, default 1 electrode per finger (prox+dist share a channel)
+# for middle/ring/pinky. thumb/index unmapped (right hand falls back to SteamVR).
+DEFAULT_FDC_MAP = {
+    "mid_p": 0, "mid_d": 0,
+    "ring_p": 1, "ring_d": 1,
+    "pinky_p": 2, "pinky_d": 2,
+    "thumb_p": None, "thumb_d": None,
+    "index_p": None, "index_d": None,
+}
+DEFAULT_FDC_CAL = {"baseline": [0, 0, 0, 0], "flexed": [0, 0, 0, 0], "delta": [0, 0, 0, 0]}
+
 DEFAULTS = {
     "baseline":   200,
     "max_delta":  185,
@@ -96,8 +116,12 @@ DEFAULTS = {
     "serial_baud": "115200",
     "mac_hand": {},  # { "mac_str": "left"/"right" }
     "hands": {
-        "left":  {"electrode_map": DEFAULT_MAP_LEFT},
-        "right": {"electrode_map": DEFAULT_MAP_RIGHT},
+        "left":  {"electrode_map": DEFAULT_MAP_LEFT,
+                  "fdc_map": dict(DEFAULT_FDC_MAP),
+                  "fdc_cal": dict(DEFAULT_FDC_CAL)},
+        "right": {"electrode_map": DEFAULT_MAP_RIGHT,
+                  "fdc_map": dict(DEFAULT_FDC_MAP),
+                  "fdc_cal": dict(DEFAULT_FDC_CAL)},
     },
 }
 
@@ -113,10 +137,13 @@ def load_config():
                     cfg[k] = user[k]
             for h in ("left", "right"):
                 if h not in cfg["hands"]:
-                    cfg["hands"][h] = {"electrode_map": DEFAULTS["hands"][h]["electrode_map"]}
+                    cfg["hands"][h] = json.loads(json.dumps(DEFAULTS["hands"][h]))
                 cfg["hands"][h].setdefault("electrode_map", {})
+                cfg["hands"][h].setdefault("fdc_map", {})
+                cfg["hands"][h].setdefault("fdc_cal", json.loads(json.dumps(DEFAULT_FDC_CAL)))
                 for jk, _ in JOINT_KEYS:
                     cfg["hands"][h]["electrode_map"].setdefault(jk, None)
+                    cfg["hands"][h]["fdc_map"].setdefault(jk, DEFAULT_FDC_MAP.get(jk))
         except Exception as e:
             print(f"[cfg] Failed to load {CONFIG_PATH}: {e}")
     # Coerce None / int electrode values
@@ -124,6 +151,12 @@ def load_config():
         for jk in cfg["hands"][h]["electrode_map"]:
             v = cfg["hands"][h]["electrode_map"][jk]
             cfg["hands"][h]["electrode_map"][jk] = None if v in (None, "None") else int(v)
+        for jk in cfg["hands"][h]["fdc_map"]:
+            v = cfg["hands"][h]["fdc_map"][jk]
+            cfg["hands"][h]["fdc_map"][jk] = None if v in (None, "None") else int(v)
+        for key in ("baseline", "flexed", "delta"):
+            lst = cfg["hands"][h]["fdc_cal"].get(key, [0, 0, 0, 0])
+            cfg["hands"][h]["fdc_cal"][key] = [float(x) for x in lst]
     return cfg
 
 
@@ -196,6 +229,8 @@ class HandState:
         self.last_packet_id = 0
         self.filtered = [0] * 12
         self.touch = 0
+        self.fdc_raw = [0] * 4
+        self.sensor_type = SENSOR_NONE
         self.meta = {"i2c_ms": 0, "loop_ms": 0, "rssi": 0, "uptime": 0}
         joint_names = [k for k, _ in JOINT_KEYS]
         self.smoothers = {k: Smoother() for k in joint_names}
@@ -447,7 +482,8 @@ def refresh_device_values():
         elif hand_state is not None and hand_state.is_alive():
             w["ip"].configure(text=hand_state.ip)
             w["fw"].configure(text=str(hand_state.fw))
-            w["ch"].configure(text="12")
+            ch_count = 4 if hand_state.sensor_type == SENSOR_FDC2214 else 12
+            w["ch"].configure(text=str(ch_count))
             elapsed = now - hand_state.last_seen
         else:
             w["ip"].configure(text="?")
@@ -490,7 +526,9 @@ bottom.pack(fill=tk.BOTH, expand=False, padx=10, pady=6)
 
 map_tabs = {}
 map_vars = {"left": {}, "right": {}}
+fdc_map_vars = {"left": {}, "right": {}}
 ELECTRODE_CHOICES = ["None"] + [str(i) for i in range(12)]
+FDC_CHOICES = ["None"] + [str(i) for i in range(4)]
 
 
 def on_map_changed(*_):
@@ -498,6 +536,9 @@ def on_map_changed(*_):
         for name, var in map_vars[h].items():
             v = var.get()
             cfg["hands"][h]["electrode_map"][name] = None if v == "None" else int(v)
+        for name, var in fdc_map_vars[h].items():
+            v = var.get()
+            cfg["hands"][h]["fdc_map"][name] = None if v == "None" else int(v)
     cfg["baseline"]  = baseline_var.get()
     cfg["max_delta"] = max_delta_var.get()
     cfg["coupling"]  = coupling_var.get()
@@ -512,17 +553,31 @@ def on_map_changed(*_):
 
 def build_map_tab(hand):
     tab = tk.Frame(bottom, bg="#222")
+    tk.Label(tab, text="Joint", bg="#222", fg="#888", font=("Consolas", 9)).grid(
+        row=0, column=0, sticky="w", padx=2)
+    tk.Label(tab, text="MPR", bg="#222", fg="#888", font=("Consolas", 9)).grid(
+        row=0, column=1, sticky="w", padx=2)
+    tk.Label(tab, text="FDC", bg="#222", fg="#888", font=("Consolas", 9)).grid(
+        row=0, column=2, sticky="w", padx=2)
     for i, (key, label) in enumerate(JOINT_KEYS):
         row, col = divmod(i, 2)
+        c = col * 3
         tk.Label(tab, text=label, bg="#222", fg="#00FF00", font=("Consolas", 9)).grid(
-            row=row, column=col * 2, sticky="e", padx=2, pady=2)
-        cur = cfg["hands"][hand]["electrode_map"].get(key, "None")
-        cur = "None" if cur is None else str(cur)
-        var = tk.StringVar(value=cur)
-        om = ttk.Combobox(tab, textvariable=var, values=ELECTRODE_CHOICES, width=6, state="readonly")
-        om.grid(row=row, column=col * 2 + 1, sticky="w", padx=2, pady=2)
-        map_vars[hand][key] = var
-        var.trace_add("write", on_map_changed)
+            row=row + 1, column=c, sticky="e", padx=2, pady=2)
+        mpr_cur = cfg["hands"][hand]["electrode_map"].get(key, "None")
+        mpr_cur = "None" if mpr_cur is None else str(mpr_cur)
+        mpr_var = tk.StringVar(value=mpr_cur)
+        ttk.Combobox(tab, textvariable=mpr_var, values=ELECTRODE_CHOICES, width=5,
+                     state="readonly").grid(row=row + 1, column=c + 1, sticky="w", padx=2, pady=2)
+        fdc_cur = cfg["hands"][hand].get("fdc_map", {}).get(key, "None")
+        fdc_cur = "None" if fdc_cur is None else str(fdc_cur)
+        fdc_var = tk.StringVar(value=fdc_cur)
+        ttk.Combobox(tab, textvariable=fdc_var, values=FDC_CHOICES, width=5,
+                     state="readonly").grid(row=row + 1, column=c + 2, sticky="w", padx=2, pady=2)
+        map_vars[hand][key] = mpr_var
+        fdc_map_vars[hand][key] = fdc_var
+        mpr_var.trace_add("write", on_map_changed)
+        fdc_var.trace_add("write", on_map_changed)
     return tab
 
 
@@ -566,6 +621,86 @@ for v in (baseline_var, max_delta_var, coupling_var,
           smooth_alpha_var, smooth_median_var, smooth_deadband_var):
     v.trace_add("write", on_map_changed)
 on_map_changed()
+
+# ---------------------------------------------------------------------------
+# FDC2214 calibration
+# ---------------------------------------------------------------------------
+cal_tab = tk.Frame(bottom, bg="#222")
+bottom.add(cal_tab, text="FDC Calibrate")
+
+_cal = None  # pending calibration: {"hand", "mode", "sums", "n", "deadline"}
+cal_status_var = tk.StringVar(value="Relax -> Set Rest, then make a fist -> Set Flex (per hand).")
+
+
+def _cal_summary(hand_name):
+    cal = cfg["hands"][hand_name].get("fdc_cal", {})
+    base = cal.get("baseline", [0, 0, 0, 0])
+    delta = cal.get("delta", [0, 0, 0, 0])
+    return "  ".join(f"ch{i}:B={int(base[i])} D={int(delta[i])}" for i in range(4))
+
+
+def _update_cal_labels():
+    cal_left_var.set(_cal_summary("left"))
+    cal_right_var.set(_cal_summary("right"))
+
+
+def _start_cal(hand_name, mode):
+    global _cal
+    hs = hands[hand_name]
+    if hs.sensor_type != SENSOR_FDC2214:
+        cal_status_var.set(f"{hand_name}: no active FDC2214 device (sensorType={hs.sensor_type}).")
+        return
+    _cal = {"hand": hand_name, "mode": mode, "sums": [0.0] * 4, "n": 0,
+            "deadline": time.time() + 0.6}
+    cal_status_var.set(f"{hand_name}: capturing '{mode}' for 0.6 s...")
+
+
+def _fdc_cal_tick():
+    global _cal
+    if _cal is None:
+        return
+    hs = hands[_cal["hand"]]
+    if hs.sensor_type != SENSOR_FDC2214 or not hs.is_alive():
+        cal_status_var.set(f"{_cal['hand']}: calibration aborted (device lost).")
+        _cal = None
+        return
+    for ch in range(4):
+        _cal["sums"][ch] += hs.fdc_raw[ch]
+    _cal["n"] += 1
+    if time.time() < _cal["deadline"]:
+        return
+    avg = [s / _cal["n"] for s in _cal["sums"]]
+    cal = cfg["hands"][_cal["hand"]].setdefault(
+        "fdc_cal", {"baseline": [0, 0, 0, 0], "flexed": [0, 0, 0, 0], "delta": [0, 0, 0, 0]})
+    if _cal["mode"] == "rest":
+        cal["baseline"] = avg
+        cal_status_var.set(f"{_cal['hand']}: rest baseline captured. Now flex and press Set Flex.")
+    else:
+        cal["flexed"] = avg
+        for ch in range(4):
+            cal["delta"][ch] = max(0.0, cal["baseline"][ch] - avg[ch])
+        cal_status_var.set(f"{_cal['hand']}: flex captured; deltas computed.")
+    save_config(cfg)
+    _update_cal_labels()
+    _cal = None
+
+
+cal_left_var = tk.StringVar(value="")
+cal_right_var = tk.StringVar(value="")
+tk.Label(cal_tab, textvariable=cal_status_var, bg="#222", fg="#FFAA00", font=("Consolas", 9)).grid(
+    row=0, column=0, columnspan=2, sticky="w", pady=4)
+for ri, hand_name in enumerate(("left", "right")):
+    frm = tk.Frame(cal_tab, bg="#222")
+    frm.grid(row=1 + ri, column=0, sticky="w", padx=6, pady=4)
+    tk.Button(frm, text=f"{hand_name}: Set Rest",
+              command=lambda h=hand_name: _start_cal(h, "rest"), bg="#333", fg="#00FF00").pack(side=tk.LEFT, padx=2)
+    tk.Button(frm, text="Set Flex",
+              command=lambda h=hand_name: _start_cal(h, "flex"), bg="#333", fg="#00FF00").pack(side=tk.LEFT, padx=2)
+_update_cal_labels()
+tk.Label(cal_tab, textvariable=cal_left_var, bg="#222", fg="#00FF00", font=("Consolas", 9)).grid(
+    row=1, column=1, sticky="w", padx=10)
+tk.Label(cal_tab, textvariable=cal_right_var, bg="#222", fg="#00FF00", font=("Consolas", 9)).grid(
+    row=2, column=1, sticky="w", padx=10)
 
 # ---------------------------------------------------------------------------
 # Serial Console tab
@@ -721,19 +856,54 @@ _refresh_ports()
 # move them with canvas.coords() instead of delete+create. This is the single
 # biggest performance fix for tkinter canvases (item creation is slow).
 # ---------------------------------------------------------------------------
+def _joint_channel(hs, joint_key):
+    """Return the mapped channel index for the active sensor (FDC 0-3 or MPR 0-11), or None."""
+    if hs.sensor_type == SENSOR_FDC2214:
+        return cfg["hands"][hs.name].get("fdc_map", {}).get(joint_key)
+    return cfg["hands"][hs.name]["electrode_map"].get(joint_key)
+
+
 def normalize_joint(hand_state, joint_key):
-    idx = cfg["hands"][hand_state.name]["electrode_map"].get(joint_key)
-    if idx is None or not (0 <= idx < 12):
+    ch = _joint_channel(hand_state, joint_key)
+    if ch is None:
         return 0.0
-    raw = hand_state.filtered[idx]
-    delta = max(0, baseline_var.get() - raw)
-    norm = min(1.0, delta / max(1, max_delta_var.get()))
+    if hand_state.sensor_type == SENSOR_FDC2214:
+        if not (0 <= ch < 4):
+            return 0.0
+        cal = cfg["hands"][hand_state.name].get("fdc_cal", {})
+        base = cal.get("baseline", [0, 0, 0, 0])[ch]
+        delta = cal.get("delta", [0, 0, 0, 0])[ch]
+        if delta <= 0:
+            return 0.0
+        raw = hand_state.fdc_raw[ch] if ch < len(hand_state.fdc_raw) else 0
+        norm = max(0.0, min(1.0, (base - raw) / delta))
+    else:
+        if not (0 <= ch < 12):
+            return 0.0
+        raw = hand_state.filtered[ch]
+        delta = max(0, baseline_var.get() - raw)
+        norm = min(1.0, delta / max(1, max_delta_var.get()))
     sm = hand_state.smoothers[joint_key]
     return sm.update(norm,
                      smooth_alpha_var.get(),
                      int(smooth_median_var.get()),
                      smooth_deadband_var.get(),
                      bool(smooth_enable_var.get()))
+
+
+def _bars_for(hs):
+    """Return the 12-slot bar array for the active sensor (scaled to bar pixels)."""
+    if hs.sensor_type == SENSOR_FDC2214:
+        bars = [0] * 12
+        cal = cfg["hands"][hs.name].get("fdc_cal", {})
+        base = cal.get("baseline", [0, 0, 0, 0])
+        delta = cal.get("delta", [0, 0, 0, 0])
+        for i in range(min(4, len(hs.fdc_raw))):
+            if delta[i] > 0:
+                norm = max(0.0, min(1.0, (base[i] - hs.fdc_raw[i]) / delta[i]))
+                bars[i] = int(norm * 120)
+        return bars
+    return hs.filtered
 
 
 class HandView:
@@ -871,7 +1041,7 @@ def render_right(hs, vr_data):
     """Right hand: thumb + index from SteamVR (overridable), other joints ESP32."""
     if not hs.is_alive():
         right_view.set_skeleton_visible(False)
-        right_view.update_bars(hs.filtered)
+        right_view.update_bars(_bars_for(hs))
         return
     right_view.set_skeleton_visible(True)
 
@@ -888,16 +1058,16 @@ def render_right(hs, vr_data):
     else:
         thumb_angle, thumb_f = -150, 0.0
 
-    idx_t = cfg["hands"]["right"]["electrode_map"].get("thumb_p")
-    idx_d = cfg["hands"]["right"]["electrode_map"].get("thumb_d")
+    idx_t = _joint_channel(hs, "thumb_p")
+    idx_d = _joint_channel(hs, "thumb_d")
     if idx_t is not None or idx_d is not None:
         thumb_p = normalize_joint(hs, "thumb_p") if idx_t is not None else thumb_f
         thumb_d = normalize_joint(hs, "thumb_d") if idx_d is not None else thumb_p
     else:
         thumb_p, thumb_d = thumb_f, thumb_f
 
-    idx_ip = cfg["hands"]["right"]["electrode_map"].get("index_p")
-    idx_id = cfg["hands"]["right"]["electrode_map"].get("index_d")
+    idx_ip = _joint_channel(hs, "index_p")
+    idx_id = _joint_channel(hs, "index_d")
     if idx_ip is not None or idx_id is not None:
         i_p = normalize_joint(hs, "index_p") if idx_ip is not None else index_flex
         i_d = normalize_joint(hs, "index_d") if idx_id is not None else i_p
@@ -914,14 +1084,14 @@ def render_right(hs, vr_data):
     right_view._update_finger("mid",    mid_p, mid_d)
     right_view._update_finger("ring",   normalize_joint(hs, "ring_p"),  normalize_joint(hs, "ring_d"))
     right_view._update_finger("pinky",  normalize_joint(hs, "pinky_p"), normalize_joint(hs, "pinky_d"))
-    right_view.update_bars(hs.filtered)
+    right_view.update_bars(_bars_for(hs))
 
 
 def render_left(hs):
     """Left hand: all joints from ESP32 electrodes."""
     if not hs.is_alive():
         left_view.set_skeleton_visible(False)
-        left_view.update_bars(hs.filtered)
+        left_view.update_bars(_bars_for(hs))
         return
     left_view.set_skeleton_visible(True)
     left_view._update_finger("thumb", normalize_joint(hs, "thumb_p"), normalize_joint(hs, "thumb_d"))
@@ -929,7 +1099,7 @@ def render_left(hs):
     left_view._update_finger("mid",   normalize_joint(hs, "mid_p"),   normalize_joint(hs, "mid_d"))
     left_view._update_finger("ring",  normalize_joint(hs, "ring_p"),  normalize_joint(hs, "ring_d"))
     left_view._update_finger("pinky", normalize_joint(hs, "pinky_p"), normalize_joint(hs, "pinky_d"))
-    left_view.update_bars(hs.filtered)
+    left_view.update_bars(_bars_for(hs))
 
 
 # Pre-allocate all canvas items once (no per-frame create/delete).
@@ -994,15 +1164,31 @@ def handle_packet(data, addr):
                     assign_hand(mac_str, h)
         rebuild_device_list()
 
-    elif ptype == TYPE_DATA and len(data) >= DATA_LEN:
-        fields = struct.unpack(DATA_FMT, data[:DATA_LEN])
-        packet_id = fields[4]
-        uptime    = fields[5]
-        filtered  = list(fields[6:18])
-        touch     = fields[18]
-        i2c_ms    = fields[19]
-        loop_ms   = fields[20]
-        rssi      = fields[21]
+    elif ptype == TYPE_DATA:
+        if fw >= 4 and len(data) >= DATA_LEN:
+            fields = struct.unpack(DATA_FMT, data[:DATA_LEN])
+            packet_id   = fields[4]
+            uptime      = fields[5]
+            filtered    = list(fields[6:18])
+            touch       = fields[18]
+            fdc_raw     = list(fields[19:23])
+            sensor_type = fields[23]
+            i2c_ms      = fields[25]
+            loop_ms     = fields[26]
+            rssi        = fields[27]
+        elif len(data) >= DATA_LEN_V3:
+            fields = struct.unpack(DATA_FMT_V3, data[:DATA_LEN_V3])
+            packet_id   = fields[4]
+            uptime      = fields[5]
+            filtered    = list(fields[6:18])
+            touch       = fields[18]
+            fdc_raw     = [0, 0, 0, 0]
+            sensor_type = SENSOR_MPR121
+            i2c_ms      = fields[19]
+            loop_ms     = fields[20]
+            rssi        = fields[21]
+        else:
+            return
         # find which hand slot owns the sender by ip
         target = None
         for h in ("left", "right"):
@@ -1034,6 +1220,8 @@ def handle_packet(data, addr):
             return
         target.filtered = filtered
         target.touch = touch
+        target.fdc_raw = fdc_raw
+        target.sensor_type = sensor_type
         target.meta = {"i2c_ms": i2c_ms, "loop_ms": loop_ms, "rssi": rssi, "uptime": uptime}
         target.last_seen = time.time()
         if packet_id > target.last_packet_id:
@@ -1048,6 +1236,8 @@ def update_gui():
         except (BlockingIOError, OSError):
             break
         handle_packet(raw_bytes, addr)
+
+    _fdc_cal_tick()
 
     # 2) sweep dead sessions: a hand that went silent gets unbound so HELLO can re-handshake
     for h in ("left", "right"):
@@ -1082,7 +1272,9 @@ def update_gui():
     for h in ("left", "right"):
         hs = hands[h]
         if hs.is_alive():
-            parts.append(f"{h.upper()}:{hs.mac} id={hs.last_packet_id} rssi={hs.meta['rssi']}dBm "
+            parts.append(f"{h.upper()}:{hs.mac} id={hs.last_packet_id} "
+                         f"sensor={SENSOR_LABELS.get(hs.sensor_type, '?')} "
+                         f"rssi={hs.meta['rssi']}dBm "
                          f"i2c={hs.meta['i2c_ms']}ms loop={hs.meta['loop_ms']}ms")
         else:
             parts.append(f"{h.upper()}:--")
