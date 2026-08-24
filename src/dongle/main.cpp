@@ -10,9 +10,8 @@
 // USB side uses the Arduino core's native TinyUSB stack (USBHID classes) - no
 // external TinyUSB library, so two copies of the stack can never fight over
 // the PHY. ARDUINO_USB_CDC_ON_BOOT must stay 0 (see platformio.ini): the
-// core's pre-setup auto-start breaks enumeration otherwise. `Serial` maps to
-// UART0 and prints logs only; configuration lives in NVS / compile-time
-// flags, reflash via BOOT+RST to change.
+// core's pre-setup auto-start breaks enumeration otherwise. The composite
+// device is HID (tracker data) + CDC (live console); UART0 mirrors the logs.
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -99,6 +98,11 @@ private:
 };
 
 TunnelHID tunnelHid;
+
+// The core's ready-made "USBSerial" global only exists when
+// ARDUINO_USB_CDC_ON_BOOT=1, which we must keep off (its pre-setup auto-start
+// breaks enumeration), so build our own CDC port on interface 0 instead.
+static USBCDC dongleCdc(0);
 
 // --- Globals -------------------------------------------------------------------
 EspNowLink nowLink;
@@ -209,16 +213,34 @@ static void handleFrame(const RxFrame& f) {
     }
 }
 
+// --- Console -------------------------------------------------------------------
+// Logs go to UART0 (bench escape hatch) and to the CDC interface of the USB
+// composite device, so a terminal on the dongle's ttyACM port sees live
+// output while it streams. Writes to CDC are gated on host DTR: USBCDC blocks
+// up to its TX timeout per call when the port is closed, which would stall
+// the radio loop. Reboot-on-DTR is disabled so open/close of the console can
+// never reset a working dongle.
+static void logf(const char* fmt, ...) {
+    char buf[160];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    Serial.write(buf, n);
+    if ((bool)dongleCdc) dongleCdc.write(buf, n);
+}
+
 // --- Setup / loop ----------------------------------------------------------------------
 void setup() {
-    // Serial maps to UART0 (CDC disabled): optional debug escape hatch on pins
-    // TXD0/RXD0. Writes are buffered and never block the radio loop.
+    // Serial maps to UART0 (CDC_ON_BOOT=0); dongleCdc joins the USB composite
+    // as a second console over the same cable.
     Serial.begin(115200);
 
     led.begin(DONGLE_RGB_LED);
     led.setState(DeviceState::Discovering);
 
-    Serial.printf("[BOOT] SloppyHands dongle FW%u\r\n", cfg::FW_VERSION);
+    logf("[BOOT] SloppyHands dongle FW%u\r\n", cfg::FW_VERSION);
 
     Preferences prefs;
     prefs.begin("dongle", true);
@@ -227,24 +249,27 @@ void setup() {
         chan = cfg::ESPNOW_CHANNEL_DEFAULT;
     prefs.end();
 
-    // Native-USB: vendor-defined HID interface. Descriptor strings/IDs must be
-    // set before USB.begin() enumerates the device; with CDC_ON_BOOT=0 this is
-    // the only USB start (no pre-setup auto-begin from the core).
+    // Native-USB composite: vendor-defined HID + CDC console. Descriptor
+    // strings/IDs must be set before USB.begin() enumerates the device; with
+    // CDC_ON_BOOT=0 this is the only USB start (no pre-setup auto-begin from
+    // the core).
     USB.manufacturerName("SloppyHands");
     USB.productName("SloppyHands ESP-NOW Dongle");
     USB.serialNumber("SLP-DONGLE-1");
     USB.VID(0x303A);                       // Espressif vendor space; PID "SL" -
     USB.PID(0x534C);                       // matched by test_tracker.py
     tunnelHid.begin();
+    dongleCdc.begin(115200);
+    dongleCdc.enableReboot(false);         // console must not reset the dongle
     if (!USB.begin()) {
-        Serial.println("[BOOT] FATAL: USB HID init failed.");
+        logf("[BOOT] FATAL: USB init failed.\r\n");
     }
 
     if (!nowLink.begin(chan)) {
-        Serial.println("[BOOT] FATAL: ESP-NOW init failed.");
+        logf("[BOOT] FATAL: ESP-NOW init failed.\r\n");
         led.setState(DeviceState::Connecting);      // solid red = radio dead
     } else {
-        Serial.printf("[BOOT] Dongle listening on ESP-NOW ch%u\r\n", chan);
+        logf("[BOOT] Dongle listening on ESP-NOW ch%u\r\n", chan);
     }
 }
 
@@ -283,9 +308,9 @@ void loop() {
     static uint32_t lastHbMs = 0;
     if (now - lastHbMs >= 5000) {
         lastHbMs = now;
-        Serial.printf("[HB] ch=%u peers=%u active=%u fwd=%lu\r\n",
-                      chan, peerCount, countActivePeers(),
-                      (unsigned long)forwardedPkts);
+        logf("[HB] ch=%u peers=%u active=%u fwd=%lu\r\n",
+             chan, peerCount, countActivePeers(),
+             (unsigned long)forwardedPkts);
     }
 
     delay(1);

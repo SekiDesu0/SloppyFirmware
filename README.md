@@ -14,7 +14,7 @@ with serial-provisioned WiFi credentials stored in NVS for the WiFi path.
 ```
 [glove L]──┐                          ┌─ USB HID input reports ─▶ test_tracker.py --source hid
            ├── ESP-NOW ─▶ [S3 dongle]─┤
-[glove R]──┘   auto-pair              └─ UART0 log output (debug)
+[glove R]──┘   auto-pair              └─ USB CDC console (+ UART0 logs) ─▶ status output
 ```
 
 Gloves hop Wi-Fi channels broadcasting HELLO beacons; the dongle listens on its
@@ -111,20 +111,18 @@ on-board LED of these boards is a plain GPIO LED, not addressable. Pins live in
 
 A separate firmware image for an ESP32-S3 board that plugs into the PC:
 
-- **Native USB** — the Arduino core's own TinyUSB stack (USBHID classes), no
-  external TinyUSB library. Vendor-defined **HID** input reports carry TUNNEL
-  frames (DATA packet + source MAC + dongle RSSI). `ARDUINO_USB_CDC_ON_BOOT`
+- **Native USB composite** — the Arduino core's own TinyUSB stack (USBHID
+  classes), no external TinyUSB library. A vendor-defined **HID** interface
+  carries TUNNEL frames (DATA packet + source MAC + dongle RSSI) while a
+  **CDC serial interface** mirrors the log output, so a console on the
+  dongle's `ttyACM` port stays live while it streams. `ARDUINO_USB_CDC_ON_BOOT`
   must stay `0`: setting it to 1 makes the core auto-start USB with default
   descriptors before `setup()` and enumeration never happens.
-- Log output goes to **UART0** (TXD0/RXD0 pins) only — there is no USB CDC
-  console on the dongle.
-- Pairs with gloves automatically: listens for HELLO broadcasts, replies
-  WELCOME, streams KEEPALIVEs every second and expires peers silent for >5 s.
-- There is **no interactive CLI**: logs print over UART0, including a
-  `[HB]` heartbeat every 5 s (`ch=` channel, `peers=`/`active=` counts,
-  `fwd=` forwarded packets). The Wi-Fi channel is persisted in NVS; to change
-  it, flash the dongle with the desired default (enter the loader via BOOT+RST)
-  or erase NVS.
+- There is **no interactive CLI**: logs print to the CDC console and UART0,
+  including a `[HB]` heartbeat every 5 s (`ch=` channel, `peers=`/`active=`
+  counts, `fwd=` forwarded packets). The Wi-Fi channel is persisted in NVS; to
+  change it, flash the dongle with the desired default (enter the loader via
+  BOOT+RST) or erase NVS.
 - VID/PID: `0x303A`/`0x534C`. Flash it with `pio run -e esp32s3-dongle -t upload`.
 
 On the PC, run the tracker against the dongle:
