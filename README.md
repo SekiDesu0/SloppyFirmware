@@ -14,7 +14,7 @@ with serial-provisioned WiFi credentials stored in NVS for the WiFi path.
 ```
 [glove L]──┐                          ┌─ USB HID input reports ─▶ test_tracker.py --source hid
            ├── ESP-NOW ─▶ [S3 dongle]─┤
-[glove R]──┘   auto-pair              └─ USB CDC console ─▶ CLI / logs
+[glove R]──┘   auto-pair              └─ UART0 log output (debug)
 ```
 
 Gloves hop Wi-Fi channels broadcasting HELLO beacons; the dongle listens on its
@@ -60,6 +60,16 @@ Pick the environment matching your board:
 | NodeMCU (ESP8266)              | `esp8266-nodemcuv2`  | needs external NeoPixel |
 | Wemos D1 Mini (ESP8266)        | `d1_mini`            | needs external NeoPixel |
 
+### Platform notes
+
+Both ESP32-S3 environments pin [pioarduino](https://github.com/pioarduino/platform-espressif32)
+— the community platform that ships arduino-esp32 3.x (IDF 5.x) — via its
+rolling `stable` release; official PlatformIO `espressif32` stopped at Arduino
+core 2.x. The ESP8266 environments use stock `espressif8266`. The dongle uses
+only the **core's** TinyUSB stack; do not add the external Adafruit TinyUSB
+library, or two copies of the USB stack collide (duplicate-symbol build
+crashes, most visibly on Windows).
+
 Compile and upload (plug the board in via USB; `PORT` is optional — PlatformIO
 auto-detects):
 
@@ -101,18 +111,20 @@ on-board LED of these boards is a plain GPIO LED, not addressable. Pins live in
 
 A separate firmware image for an ESP32-S3 board that plugs into the PC:
 
-- **USB composite device** (TinyUSB): vendor-defined **HID** input reports
-  carry TUNNEL frames (DATA packet + source MAC + dongle RSSI), while **CDC
-  serial** stays available as a console:
-  ```
-  status        fw / channel / peer count / forwarded packets
-  list          known glove peers with age + last packet id
-  channel <n>   change ESP-NOW Wi-Fi channel (persisted in NVS)
-  forget        drop the peer table
-  reset | help
-  ```
-- Listens for HELLO broadcasts, replies WELCOME, streams KEEPALIVEs every
-  second and expires peers silent for >5 s.
+- **Native USB** — the Arduino core's own TinyUSB stack (USBHID classes), no
+  external TinyUSB library. Vendor-defined **HID** input reports carry TUNNEL
+  frames (DATA packet + source MAC + dongle RSSI). `ARDUINO_USB_CDC_ON_BOOT`
+  must stay `0`: setting it to 1 makes the core auto-start USB with default
+  descriptors before `setup()` and enumeration never happens.
+- Log output goes to **UART0** (TXD0/RXD0 pins) only — there is no USB CDC
+  console on the dongle.
+- Pairs with gloves automatically: listens for HELLO broadcasts, replies
+  WELCOME, streams KEEPALIVEs every second and expires peers silent for >5 s.
+- There is **no interactive CLI**: logs print over UART0, including a
+  `[HB]` heartbeat every 5 s (`ch=` channel, `peers=`/`active=` counts,
+  `fwd=` forwarded packets). The Wi-Fi channel is persisted in NVS; to change
+  it, flash the dongle with the desired default (enter the loader via BOOT+RST)
+  or erase NVS.
 - VID/PID: `0x303A`/`0x534C`. Flash it with `pio run -e esp32s3-dongle -t upload`.
 
 On the PC, run the tracker against the dongle:
@@ -123,9 +135,9 @@ python test_tracker.py --source hid          # --vid/--pid to override matching
 ```
 
 Glove-side commands of interest: `transport espnow`, `pair clear`, `status`
-(shows link/dongle/RSSI). To move everything to another channel, set it on the
-dongle first (`channel n`), then `pair clear` on each glove so they re-hop from
-their default and re-pair.
+(shows link/dongle/RSSI). To move everything to another channel, flash the
+dongle with the new channel, then `pair clear` on each glove so they re-hop
+from their default and re-pair.
 
 - **All 12 MPR121 electrodes streamed every frame.** The server (not the
   device) decides which electrode maps to which finger joint, so you can
