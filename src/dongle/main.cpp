@@ -20,6 +20,8 @@
 #include <Preferences.h>
 #include "USB.h"
 #include "USBHID.h"
+#include "class/cdc/cdc_device.h"   // direct tud_cdc_n_* output (DTR-independent)
+#include "device/usbd.h"            // tud_mounted()
 
 #include "config.h"
 #include "PacketIO.h"
@@ -221,9 +223,56 @@ static void handleFrame(const RxFrame& f) {
 // --- Console -------------------------------------------------------------------
 // Logs go to UART0 (bench escape hatch) and to the CDC interface of the USB
 // composite device, so a terminal on the dongle's ttyACM port sees live
-// output while it streams. Writes to CDC are gated on host DTR: USBCDC blocks
-// up to its TX timeout per call when the port is closed, which would stall
-// the radio loop.
+// output while it streams.
+//
+// CDC output bypasses USBCDC::write(): the core's wrapper silently drops
+// everything unless the host asserts DTR, but terminals like the tracker
+// console keep DTR low. Direct TinyUSB calls deliver as soon as the device
+// is configured; once the 64 B endpoint FIFO fills, extra bytes drop
+// (non-blocking), which is fine for log/console traffic.
+static void cdcOut(const char* s, size_t n) {
+    if (!n || !tud_mounted()) return;
+    // Push through the 64 B endpoint FIFO, yielding while the host drains it,
+    // so bursts longer than one USB frame don't drop bytes. Worst case block
+    // is bounded (~50 ms) and only ever hit while printing long CLI output.
+    // NOTE: hosts that keep DTR asserted get bit-exact output; hosts holding
+    // DTR low (rare - the tracker console raises DTR after opening) may still
+    // lose small chunks inside bursts longer than ~2 USB frames. Short
+    // outputs (status lines, prompts, echoes) are unaffected.
+    size_t off = 0;
+    uint32_t spins = 0;
+    while (off < n && spins < 500) {
+        size_t w = tud_cdc_n_write(0, s + off, n - off);
+        tud_cdc_n_write_flush(0);
+        if (w) {
+            off += w;
+            spins = 0;
+        } else {
+            delayMicroseconds(100);
+            spins++;
+        }
+    }
+}
+
+static void cliPrint(const char* s) {
+    cdcOut(s, strlen(s));
+}
+
+static void cliPrintln(const char* s) {
+    cdcOut(s, strlen(s));
+    cdcOut("\r\n", 2);
+}
+
+static void cliPrintf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+static void cliPrintf(const char* fmt, ...) {
+    char buf[160];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) cdcOut(buf, n);
+}
+
 static void logf(const char* fmt, ...) {
     char buf[160];
     va_list ap;
@@ -232,46 +281,48 @@ static void logf(const char* fmt, ...) {
     va_end(ap);
     if (n <= 0) return;
     Serial.write(buf, n);
-    if ((bool)dongleCdc) dongleCdc.write(buf, n);
+    cdcOut(buf, n);
 }
 
 // --- Console CLI -----------------------------------------------------------------
 // Lives on the USB CDC interface only: the dongle hangs off a single USB
 // cable, so UART0 stays a logs-only escape hatch for bench debugging. Same
 // conventions as the glove CLI: local echo, backspace/DEL editing, '> '
-// prompt. The banner appears when the host opens the port (DTR), not at boot.
+// prompt. All output goes through cdcOut(), so it works even when the host
+// keeps DTR low; the banner prints on DTR rise or on the first keystroke.
 static String cliLine;
 static bool   cliPrompted = false;
+static bool   cliLastWasCR = false;
 
 static void cliHelp() {
-    dongleCdc.println("Commands:");
-    dongleCdc.println("  status       FW / channel / peer summary");
-    dongleCdc.println("  list         Known glove peers (age, RSSI, last packet)");
-    dongleCdc.println("  channel <n>  Set ESP-NOW Wi-Fi channel, persist & reboot");
-    dongleCdc.println("  forget       Drop the in-RAM peer table (gloves re-pair)");
-    dongleCdc.println("  pair clear   Alias for 'forget'");
-    dongleCdc.println("  reset        Soft-reset the dongle");
-    dongleCdc.println("  help         Show this message");
+    cliPrintln("Commands:");
+    cliPrintln("  status       FW / channel / peer summary");
+    cliPrintln("  list         Known glove peers (age, RSSI, last packet)");
+    cliPrintln("  channel <n>  Set ESP-NOW Wi-Fi channel, persist & reboot");
+    cliPrintln("  forget       Drop the in-RAM peer table (gloves re-pair)");
+    cliPrintln("  pair clear   Alias for 'forget'");
+    cliPrintln("  reset        Soft-reset the dongle");
+    cliPrintln("  help         Show this message");
 }
 
 static void cliStatus() {
-    dongleCdc.printf("fw=%u ch=%u\r\n", cfg::FW_VERSION, chan);
-    dongleCdc.printf("peers: known=%u active=%u forwarded=%lu helloReplies=%lu\r\n",
+    cliPrintf("fw=%u ch=%u\r\n", cfg::FW_VERSION, chan);
+    cliPrintf("peers: known=%u active=%u forwarded=%lu helloReplies=%lu\r\n",
                      peerCount, countActivePeers(),
                      (unsigned long)forwardedPkts, (unsigned long)helloReplies);
-    dongleCdc.printf("usb: mounted=%d uptime=%lus\r\n",
+    cliPrintf("usb: mounted=%d uptime=%lus\r\n",
                      (int)(bool)USB, millis() / 1000);
 }
 
 static void cliList() {
     if (!peerCount) {
-        dongleCdc.println("Peer table empty.");
+        cliPrintln("Peer table empty.");
         return;
     }
     uint32_t now = millis();
     for (uint8_t i = 0; i < peerCount; i++) {
         const Peer& p = peers[i];
-        dongleCdc.printf("%02X:%02X:%02X:%02X:%02X:%02X %s age=%lus rssi=%d pktId=%lu\r\n",
+        cliPrintf("%02X:%02X:%02X:%02X:%02X:%02X %s age=%lus rssi=%d pktId=%lu\r\n",
                          p.mac[0], p.mac[1], p.mac[2], p.mac[3], p.mac[4], p.mac[5],
                          p.active ? "active" : "stale ",
                          (unsigned long)((now - p.lastSeenMs) / 1000),
@@ -291,7 +342,7 @@ static void cliExec(const String& line) {
     if (t.startsWith("channel ")) {
         int n = t.substring(8).toInt();
         if (n < cfg::ESPNOW_CHANNEL_MIN || n > cfg::ESPNOW_CHANNEL_MAX) {
-            dongleCdc.printf("Usage: channel <%u..%u>\r\n",
+            cliPrintf("Usage: channel <%u..%u>\r\n",
                              cfg::ESPNOW_CHANNEL_MIN, cfg::ESPNOW_CHANNEL_MAX);
             return;
         }
@@ -299,7 +350,7 @@ static void cliExec(const String& line) {
         prefs.begin("dongle", false);
         prefs.putUChar("ch", (uint8_t)n);
         prefs.end();
-        dongleCdc.printf("Channel %d stored. Rebooting...\r\n", n);
+        cliPrintf("Channel %d stored. Rebooting...\r\n", n);
         delay(100);
         ESP.restart();
         return;
@@ -308,49 +359,62 @@ static void cliExec(const String& line) {
     if (t == "forget" || t == "pair clear") {
         peerCount = 0;
         memset(peers, 0, sizeof(peers));
-        dongleCdc.println("Peer table dropped. Gloves will re-pair.");
+        cliPrintln("Peer table dropped. Gloves will re-pair.");
         return;
     }
 
     if (t == "reset") {
-        dongleCdc.println("Rebooting...");
+        cliPrintln("Rebooting...");
         delay(100);
         ESP.restart();
         return;
     }
 
-    dongleCdc.println("Unknown command. Type 'help'.");
+    cliPrintln("Unknown command. Type 'help'.");
 }
 
 static void cliPump() {
-    if (!(bool)dongleCdc) {
-        cliPrompted = false;      // re-banner on next connect
-        return;
-    }
-    if (!cliPrompted) {
+    // Reads are pumped regardless of DTR (hosts may keep it low). The banner
+    // prints when DTR rises or, failing that, on the first keystroke.
+    static bool lastDtr = false;
+    bool dtr = (bool)dongleCdc;
+    if (!dtr) lastDtr = false;
+
+    if (!cliPrompted && (dtr || dongleCdc.available())) {
         cliPrompted = true;
         cliLine = "";
-        dongleCdc.println();
-        dongleCdc.printf("SloppyHands dongle FW%u - console ready.\r\n", cfg::FW_VERSION);
+        cdcOut("\r\n", 2);
+        cliPrintf("SloppyHands dongle FW%u - console ready.\r\n", cfg::FW_VERSION);
         cliHelp();
-        dongleCdc.print("> ");
+        cliPrint("> ");
     }
+    if (dtr && !lastDtr && cliPrompted) {
+        // Re-show the prompt alone when a terminal re-attaches mid-session.
+        cliPrint("\r\n> ");
+    }
+    lastDtr = dtr;
+
     while (dongleCdc.available()) {
         char c = (char)dongleCdc.read();
+        if (c == '\n' && cliLastWasCR) {          // swallow LF of a CRLF pair
+            cliLastWasCR = false;
+            continue;
+        }
+        cliLastWasCR = (c == '\r');
         if (c == '\r' || c == '\n') {
-            dongleCdc.println();
+            cliPrint("\r\n");
             cliExec(cliLine);
             cliLine = "";
-            dongleCdc.print("> ");
+            cliPrint("> ");
         } else if (c == 0x08 || c == 0x7F) {          // backspace / DEL
             if (cliLine.length()) {
                 cliLine.remove(cliLine.length() - 1);
-                dongleCdc.write("\b \b");
+                cdcOut("\b \b", 3);
             }
         } else if (c >= 0x20 && c < 0x7F) {           // printable: local echo
             if (cliLine.length() < 128) {
                 cliLine += c;
-                dongleCdc.write(c);
+                { char cc = c; cdcOut(&cc, 1); }
             }
         }
     }

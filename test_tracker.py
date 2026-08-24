@@ -889,6 +889,11 @@ def _serial_connect(port_var, baud_var, btn, append_fn, send_entry, send_btn):
         sp.dtr = False
         sp.rts = False
         sp.open()
+        time.sleep(0.1)
+        # Native-USB CDC devices (ESP32-S3) gate their console output on DTR.
+        # Asserting DTR alone is safe for UART-bridge boards: the auto-reset
+        # circuit only fires when RTS is asserted alongside it.
+        sp.dtr = True
         _serial_port = sp
         _serial_running = True
         cfg["serial_port"] = port
