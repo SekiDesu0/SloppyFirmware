@@ -14,7 +14,7 @@ with serial-provisioned WiFi credentials stored in NVS for the WiFi path.
 ```
 [glove L]──┐                          ┌─ USB HID input reports ─▶ test_tracker.py --source hid
            ├── ESP-NOW ─▶ [S3 dongle]─┤
-[glove R]──┘   auto-pair              └─ USB CDC console (+ UART0 logs) ─▶ status output
+[glove R]──┘   auto-pair              └─ USB CDC serial console ─▶ CLI / status
 ```
 
 Gloves hop Wi-Fi channels broadcasting HELLO beacons; the dongle listens on its
@@ -118,11 +118,19 @@ A separate firmware image for an ESP32-S3 board that plugs into the PC:
   dongle's `ttyACM` port stays live while it streams. `ARDUINO_USB_CDC_ON_BOOT`
   must stay `0`: setting it to 1 makes the core auto-start USB with default
   descriptors before `setup()` and enumeration never happens.
-- There is **no interactive CLI**: logs print to the CDC console and UART0,
-  including a `[HB]` heartbeat every 5 s (`ch=` channel, `peers=`/`active=`
-  counts, `fwd=` forwarded packets). The Wi-Fi channel is persisted in NVS; to
-  change it, flash the dongle with the desired default (enter the loader via
-  BOOT+RST) or erase NVS.
+- **Serial console** on the same USB cable (the dongle's `ttyACM` port; open it
+  and the banner + prompt appear immediately):
+  ```
+  status        fw / channel / peer count / forwarded packets
+  list          known glove peers with age, RSSI and last packet id
+  channel <n>   set ESP-NOW Wi-Fi channel (persisted in NVS, reboots)
+  forget        drop the in-RAM peer table; gloves re-pair on next HELLO
+  pair clear    alias for 'forget'
+  reset | help
+  ```
+- Log output (`[HB]` heartbeat every 5 s: `ch=` channel, `peers=`/`active=`
+  counts, `fwd=` forwarded packets) mirrors to the console **and UART0**
+  (TXD0/RXD0 pins — bench escape hatch only).
 - VID/PID: `0x303A`/`0x534C`. Flash it with `pio run -e esp32s3-dongle -t upload`.
 
 On the PC, run the tracker against the dongle:

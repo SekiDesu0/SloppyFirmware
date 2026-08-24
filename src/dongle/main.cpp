@@ -112,6 +112,7 @@ struct Peer {
     uint8_t  mac[6];
     uint32_t lastSeenMs;
     uint32_t lastPacketId;
+    int8_t   lastRssi;
     bool     active;
 };
 
@@ -166,7 +167,10 @@ static void handleFrame(const RxFrame& f) {
         case static_cast<uint8_t>(PacketType::Hello): {
             if (f.len < (int)sizeof(HelloPacket)) break;
             Peer* p = upsertPeer(f.mac);
-            if (p) p->lastSeenMs = millis();
+            if (p) {
+                p->lastSeenMs = millis();
+                p->lastRssi   = f.rssi;
+            }
             nowLink.addPeer(f.mac);                 // ensure unicast path exists
             // WELCOME back: dataPort unused on ESP-NOW; keepalive cadence only.
             WelcomePacket w;
@@ -186,6 +190,7 @@ static void handleFrame(const RxFrame& f) {
             memcpy(&d, f.data, sizeof(d));
             p->lastSeenMs   = millis();
             p->lastPacketId = d.packetId;
+            p->lastRssi     = f.rssi;
             p->active       = true;
             TunnelPacket t;
             PacketIO::buildTunnel(t, f.mac, f.rssi, d);
@@ -218,8 +223,7 @@ static void handleFrame(const RxFrame& f) {
 // composite device, so a terminal on the dongle's ttyACM port sees live
 // output while it streams. Writes to CDC are gated on host DTR: USBCDC blocks
 // up to its TX timeout per call when the port is closed, which would stall
-// the radio loop. Reboot-on-DTR is disabled so open/close of the console can
-// never reset a working dongle.
+// the radio loop.
 static void logf(const char* fmt, ...) {
     char buf[160];
     va_list ap;
@@ -229,6 +233,127 @@ static void logf(const char* fmt, ...) {
     if (n <= 0) return;
     Serial.write(buf, n);
     if ((bool)dongleCdc) dongleCdc.write(buf, n);
+}
+
+// --- Console CLI -----------------------------------------------------------------
+// Lives on the USB CDC interface only: the dongle hangs off a single USB
+// cable, so UART0 stays a logs-only escape hatch for bench debugging. Same
+// conventions as the glove CLI: local echo, backspace/DEL editing, '> '
+// prompt. The banner appears when the host opens the port (DTR), not at boot.
+static String cliLine;
+static bool   cliPrompted = false;
+
+static void cliHelp() {
+    dongleCdc.println("Commands:");
+    dongleCdc.println("  status       FW / channel / peer summary");
+    dongleCdc.println("  list         Known glove peers (age, RSSI, last packet)");
+    dongleCdc.println("  channel <n>  Set ESP-NOW Wi-Fi channel, persist & reboot");
+    dongleCdc.println("  forget       Drop the in-RAM peer table (gloves re-pair)");
+    dongleCdc.println("  pair clear   Alias for 'forget'");
+    dongleCdc.println("  reset        Soft-reset the dongle");
+    dongleCdc.println("  help         Show this message");
+}
+
+static void cliStatus() {
+    dongleCdc.printf("fw=%u ch=%u\r\n", cfg::FW_VERSION, chan);
+    dongleCdc.printf("peers: known=%u active=%u forwarded=%lu helloReplies=%lu\r\n",
+                     peerCount, countActivePeers(),
+                     (unsigned long)forwardedPkts, (unsigned long)helloReplies);
+    dongleCdc.printf("usb: mounted=%d uptime=%lus\r\n",
+                     (int)(bool)USB, millis() / 1000);
+}
+
+static void cliList() {
+    if (!peerCount) {
+        dongleCdc.println("Peer table empty.");
+        return;
+    }
+    uint32_t now = millis();
+    for (uint8_t i = 0; i < peerCount; i++) {
+        const Peer& p = peers[i];
+        dongleCdc.printf("%02X:%02X:%02X:%02X:%02X:%02X %s age=%lus rssi=%d pktId=%lu\r\n",
+                         p.mac[0], p.mac[1], p.mac[2], p.mac[3], p.mac[4], p.mac[5],
+                         p.active ? "active" : "stale ",
+                         (unsigned long)((now - p.lastSeenMs) / 1000),
+                         (int)p.lastRssi, (unsigned long)p.lastPacketId);
+    }
+}
+
+static void cliExec(const String& line) {
+    String t = line;
+    t.trim();
+    if (!t.length()) return;
+
+    if (t == "help")   { cliHelp();   return; }
+    if (t == "status") { cliStatus(); return; }
+    if (t == "list")   { cliList();   return; }
+
+    if (t.startsWith("channel ")) {
+        int n = t.substring(8).toInt();
+        if (n < cfg::ESPNOW_CHANNEL_MIN || n > cfg::ESPNOW_CHANNEL_MAX) {
+            dongleCdc.printf("Usage: channel <%u..%u>\r\n",
+                             cfg::ESPNOW_CHANNEL_MIN, cfg::ESPNOW_CHANNEL_MAX);
+            return;
+        }
+        Preferences prefs;
+        prefs.begin("dongle", false);
+        prefs.putUChar("ch", (uint8_t)n);
+        prefs.end();
+        dongleCdc.printf("Channel %d stored. Rebooting...\r\n", n);
+        delay(100);
+        ESP.restart();
+        return;
+    }
+
+    if (t == "forget" || t == "pair clear") {
+        peerCount = 0;
+        memset(peers, 0, sizeof(peers));
+        dongleCdc.println("Peer table dropped. Gloves will re-pair.");
+        return;
+    }
+
+    if (t == "reset") {
+        dongleCdc.println("Rebooting...");
+        delay(100);
+        ESP.restart();
+        return;
+    }
+
+    dongleCdc.println("Unknown command. Type 'help'.");
+}
+
+static void cliPump() {
+    if (!(bool)dongleCdc) {
+        cliPrompted = false;      // re-banner on next connect
+        return;
+    }
+    if (!cliPrompted) {
+        cliPrompted = true;
+        cliLine = "";
+        dongleCdc.println();
+        dongleCdc.printf("SloppyHands dongle FW%u - console ready.\r\n", cfg::FW_VERSION);
+        cliHelp();
+        dongleCdc.print("> ");
+    }
+    while (dongleCdc.available()) {
+        char c = (char)dongleCdc.read();
+        if (c == '\r' || c == '\n') {
+            dongleCdc.println();
+            cliExec(cliLine);
+            cliLine = "";
+            dongleCdc.print("> ");
+        } else if (c == 0x08 || c == 0x7F) {          // backspace / DEL
+            if (cliLine.length()) {
+                cliLine.remove(cliLine.length() - 1);
+                dongleCdc.write("\b \b");
+            }
+        } else if (c >= 0x20 && c < 0x7F) {           // printable: local echo
+            if (cliLine.length() < 128) {
+                cliLine += c;
+                dongleCdc.write(c);
+            }
+        }
+    }
 }
 
 // --- Setup / loop ----------------------------------------------------------------------
@@ -260,7 +385,10 @@ void setup() {
     USB.PID(0x534C);                       // matched by test_tracker.py
     tunnelHid.begin();
     dongleCdc.begin(115200);
-    dongleCdc.enableReboot(false);         // console must not reset the dongle
+    // Keep CDC reboot-on-esptool-pattern ENABLED: with TinyUSB owning the PHY
+    // there is no hardware USB-JTAG-serial unit left, so this hook is the only
+    // way 'pio run -t upload' can reach the bootloader over the single cable.
+    // Plain terminals cannot produce the exact DTR/RTS sequence by accident.
     if (!USB.begin()) {
         logf("[BOOT] FATAL: USB init failed.\r\n");
     }
@@ -312,6 +440,8 @@ void loop() {
              chan, peerCount, countActivePeers(),
              (unsigned long)forwardedPkts);
     }
+
+    cliPump();
 
     delay(1);
 }
