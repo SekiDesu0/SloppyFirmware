@@ -131,7 +131,10 @@ A separate firmware image for an ESP32-S3 board that plugs into the PC:
 - Log output (`[HB]` heartbeat every 5 s: `ch=` channel, `peers=`/`active=`
   counts, `fwd=` forwarded packets) mirrors to the console **and UART0**
   (TXD0/RXD0 pins — bench escape hatch only).
-- VID/PID: `0x303A`/`0x534C`. Flash it with `pio run -e esp32s3-dongle -t upload`.
+- VID/PID: `0x303A`/`0x534C`. Flash it with `pio run -e esp32s3-dongle -t upload`
+  — a pre-upload hook (`tools/dongle_preupload.py`) knocks the running app into
+  the bootloader first, so a single command suffices (TinyUSB owns the PHY, so
+  the usual hardware auto-reset path doesn't exist here).
 
 On the PC, run the tracker against the dongle:
 
