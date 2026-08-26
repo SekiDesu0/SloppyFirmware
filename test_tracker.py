@@ -85,6 +85,15 @@ TUNNEL_FMT = HEADER_FMT + "6sbB"
 TUNNEL_HDR_LEN = struct.calcsize(TUNNEL_FMT)
 TUNNEL_LEN = TUNNEL_HDR_LEN + DATA_LEN
 
+# The dongle splits each 82-byte TUNNEL frame across two HID input reports
+# (report ID 1 = first 62 bytes, report ID 2 = remaining 20) because a
+# full-speed interrupt endpoint caps at 64 bytes/transaction. hidraw (Linux)
+# returns each report at its exact size; Windows' HID class driver instead
+# pads every report to the largest report size (62), so report ID 2 arrives
+# as 63 bytes there. Always slice to TUNNEL_PART2_LEN.
+TUNNEL_PART1_LEN = 62
+TUNNEL_PART2_LEN = TUNNEL_LEN - TUNNEL_PART1_LEN
+
 HELLO_LEN = struct.calcsize(HELLO_FMT)
 WELCOME_LEN = struct.calcsize(WELCOME_FMT)
 KEEP_LEN = struct.calcsize(KEEP_FMT)
@@ -1327,12 +1336,16 @@ def ingest_hid_reports():
     """Drain TUNNEL input reports from the ESP-NOW dongle (non-blocking).
 
     The 82-byte TunnelPacket arrives split across two HID report IDs
-    (ID1: first 64 bytes, ID2: remaining 18). hidapi/hidraw prefix each
+    (ID1: first 62 bytes, ID2: remaining 20). hidapi/hidraw prefix each
     read with the report-id byte; reassemble before parsing.
+
+    Windows pads every input report to the largest report size, so report
+    ID 2 is 63 bytes there (1 id + 62, vs 1 + 20 on Linux). Slice to
+    TUNNEL_PART2_LEN and accept any length >= that so both backends work.
     """
     global _hid_part1
     while True:
-        report = hid_dev.read(96)   # [] when empty; len = 65 or 19 with ID byte
+        report = hid_dev.read(96)
         if not report:
             break
         if not isinstance(report, (bytes, bytearray)):
@@ -1344,9 +1357,10 @@ def ingest_hid_reports():
         rid = report[0]
         payload = report[1:]
         if rid == 1:
-            _hid_part1 = payload[:62]
-        elif rid == 2 and len(_hid_part1) == 62 and len(payload) == TUNNEL_LEN - 62:
-            data = _hid_part1 + payload
+            _hid_part1 = payload[:TUNNEL_PART1_LEN]
+        elif rid == 2 and len(_hid_part1) == TUNNEL_PART1_LEN \
+                and len(payload) >= TUNNEL_PART2_LEN:
+            data = _hid_part1 + payload[:TUNNEL_PART2_LEN]
             _hid_part1 = b""
             if len(data) < TUNNEL_HDR_LEN:
                 continue
