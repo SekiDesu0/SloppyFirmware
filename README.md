@@ -280,8 +280,9 @@ packets ride over both transports unchanged; only TUNNEL is HID-specific.
 
 `test_tracker.py` is the reference server/tracker. It:
 
-1. Binds UDP 4242 (`--source udp`, default) **or** reads TUNNEL reports from
-   the dongle's HID interface (`--source hid`).
+1. Binds UDP 4242 (`--source udp`) **or** reads TUNNEL reports from
+   the dongle's HID interface (`--source hid`). The source is also a pair of
+   radio buttons in the GUI and can be switched while running (see 12).
 2. Listens for `HELLO` broadcasts from multiple devices simultaneously.
 3. Replies with a unicast `WELCOME` (`dataPort=4242`, `keepaliveMs=1000`) per device.
 4. Parses incoming `DATA` packets (12 MPR121 electrodes + touch bitmask, or 4 FDC2214 raw channels, + RSSI + timing).
@@ -301,18 +302,32 @@ packets ride over both transports unchanged; only TUNNEL is HID-specific.
    captures a resting `baseline` and a flexed value per channel, then the
    tracker normalizes `flex = clamp((baseline − raw) / delta, 0..1)`, driving
    the bars and skeleton fingers.
-9. **Smoothing** — per-joint pipeline: median filter -> EMA -> deadband.
+9. **MPR121 calibration** — an `MPR Calibrate` tab does the same per-channel
+   rest/flex capture across all 12 electrodes (`mpr_cal` in
+   `tracker_config.json`). Channels with a captured delta normalize through
+   it; uncalibrated channels keep falling back to the global Baseline /
+   Max Delta sliders. Both calibrate tabs have a `Reset Cal` button per hand
+   that zeroes that hand's captured table again.
+10. **Smoothing** — per-joint pipeline: median filter -> EMA -> deadband.
    Global sliders in the Settings tab.
    - `Snake`/EMA alpha — 0.01 (smooth) .. 1.0 (raw)
    - median window — odd 1..9 (spike rejection)
    - deadband — ignore tiny jitter (0 .. 0.2)
-10. Drops devices that go silent for >5 s back to Pending so they re-handshake
+11. Drops devices that go silent for >5 s back to Pending so they re-handshake
     on the next `HELLO`.
+12. **Runtime source switching + dongle hotplug** — radio buttons above the
+    device list pick `WiFi UDP` vs `ESP-NOW dongle` while the tracker is
+    running; the choice persists in `tracker_config.json` (`--source` remains
+    a boot override). In dongle mode an unplugged USB dongle turns the status
+    line red (`[DONGLE OFFLINE]`) and skeletons drop out via the normal 5 s
+    timeout; plugging it back in reconnects automatically and gloves resume
+    their saved hand slots. Starting in HID mode with no dongle attached also
+    works: the tracker waits for it instead of exiting.
 
 Run it:
 
 ```
-python test_tracker.py
+python test_tracker.py [--source udp|hid]
 ```
 
 Requires SteamVR only if you want right-hand thumb/index fusion; falls back

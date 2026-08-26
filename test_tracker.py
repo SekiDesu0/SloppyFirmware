@@ -108,14 +108,15 @@ DONGLE_VID_DEFAULT = 0x303A   # Espressif
 DONGLE_PID_DEFAULT = 0x534C   # "SL" - SloppyHands dongle
 
 _argp = argparse.ArgumentParser(description="SloppyHands tracker")
-_argp.add_argument("--source", choices=["udp", "hid"], default="udp",
-                   help="data source: udp (WiFi, default) or hid (ESP-NOW dongle)")
+_argp.add_argument("--source", choices=["udp", "hid"], default=None,
+                   help="boot data source: udp (WiFi) or hid (ESP-NOW dongle). "
+                        "Default: saved config, else udp")
 _argp.add_argument("--vid", type=lambda x: int(x, 0), default=DONGLE_VID_DEFAULT,
                    help="dongle USB VID (hex ok)")
 _argp.add_argument("--pid", type=lambda x: int(x, 0), default=DONGLE_PID_DEFAULT,
                    help="dongle USB PID (hex ok)")
 ARGS = _argp.parse_args()
-SOURCE = ARGS.source
+SOURCE = None   # resolved after config + GUI load; see "Resolve boot source"
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +151,9 @@ DEFAULT_FDC_MAP = {
     "index_p": None, "index_d": None,
 }
 DEFAULT_FDC_CAL = {"baseline": [0, 0, 0, 0], "flexed": [0, 0, 0, 0], "delta": [0, 0, 0, 0]}
+# MPR121: same shape but across all 12 electrodes. Filtered values DROP as
+# capacitance rises (touch/flex), so flex = baseline - raw, same as FDC.
+DEFAULT_MPR_CAL = {"baseline": [0] * 12, "flexed": [0] * 12, "delta": [0] * 12}
 
 DEFAULTS = {
     "baseline":   200,
@@ -163,14 +167,17 @@ DEFAULTS = {
     },
     "serial_port": "",
     "serial_baud": "115200",
+    "source": "udp",   # last active data source (udp | hid), --source overrides
     "mac_hand": {},  # { "mac_str": "left"/"right" }
     "hands": {
         "left":  {"electrode_map": DEFAULT_MAP_LEFT,
                   "fdc_map": dict(DEFAULT_FDC_MAP),
-                  "fdc_cal": dict(DEFAULT_FDC_CAL)},
+                  "fdc_cal": json.loads(json.dumps(DEFAULT_FDC_CAL)),
+                  "mpr_cal": json.loads(json.dumps(DEFAULT_MPR_CAL))},
         "right": {"electrode_map": DEFAULT_MAP_RIGHT,
                   "fdc_map": dict(DEFAULT_FDC_MAP),
-                  "fdc_cal": dict(DEFAULT_FDC_CAL)},
+                  "fdc_cal": json.loads(json.dumps(DEFAULT_FDC_CAL)),
+                  "mpr_cal": json.loads(json.dumps(DEFAULT_MPR_CAL))},
     },
 }
 
@@ -190,6 +197,7 @@ def load_config():
                 cfg["hands"][h].setdefault("electrode_map", {})
                 cfg["hands"][h].setdefault("fdc_map", {})
                 cfg["hands"][h].setdefault("fdc_cal", json.loads(json.dumps(DEFAULT_FDC_CAL)))
+                cfg["hands"][h].setdefault("mpr_cal", json.loads(json.dumps(DEFAULT_MPR_CAL)))
                 for jk, _ in JOINT_KEYS:
                     cfg["hands"][h]["electrode_map"].setdefault(jk, None)
                     cfg["hands"][h]["fdc_map"].setdefault(jk, DEFAULT_FDC_MAP.get(jk))
@@ -206,6 +214,10 @@ def load_config():
         for key in ("baseline", "flexed", "delta"):
             lst = cfg["hands"][h]["fdc_cal"].get(key, [0, 0, 0, 0])
             cfg["hands"][h]["fdc_cal"][key] = [float(x) for x in lst]
+        for key in ("baseline", "flexed", "delta"):
+            lst = cfg["hands"][h]["mpr_cal"].get(key, [0] * 12)
+            # pad to 12 so per-channel indexing can never IndexError
+            cfg["hands"][h]["mpr_cal"][key] = ([float(x) for x in lst] + [0.0] * 12)[:12]
     return cfg
 
 
@@ -218,64 +230,108 @@ def save_config(cfg):
 
 
 # ---------------------------------------------------------------------------
-# UDP (classic WiFi path) / HID (ESP-NOW dongle path)
+# Data-source lifecycle: WiFi UDP socket vs ESP-NOW dongle HID device.
+#
+# Both transports open lazily through set_source()/open_source() so the GUI
+# can switch between them at runtime, and so HID mode can start degraded
+# (dongle unplugged) and connect whenever it appears. The dongle presence
+# watchdog runs in update_gui(); read errors in ingest_hid_reports() drop the
+# handle and let the watchdog reopen it.
 # ---------------------------------------------------------------------------
 sock = None
 hid_dev = None
 _hid_part1 = b""   # reassembly buffer for HID report ID 1 (first 62 bytes)
+dongle_offline = False        # HID mode: dongle not enumerable right now
+_last_dongle_poll = 0.0
 
-if SOURCE == "udp":
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("0.0.0.0", PORT))
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.setblocking(False)
-    print(f"Server listening for HELLO broadcasts on UDP {PORT}")
-else:
-    if not HID_AVAILABLE:
-        raise SystemExit("--source hid requires the 'hid' package:  pip install hidapi")
-    matches = [d for d in hidapi.enumerate(ARGS.vid, ARGS.pid)]
-    if not matches:
-        raise SystemExit(
-            f"No HID device with VID={ARGS.vid:#06x} PID={ARGS.pid:#06x} found.\n"
-            "Is the SloppyHands dongle plugged in? (--vid/--pid to override)")
 
-    class _RawHidShim:
-        """Minimal os-level hidraw reader with hidapi-compatible .read()."""
-        def __init__(self, node):
-            self._fd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+def open_udp():
+    """Bind the HELLO/DATA UDP socket. Returns False if the port is taken."""
+    global sock
+    close_udp()
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("0.0.0.0", PORT))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.setblocking(False)
+        print(f"[server] listening for HELLO broadcasts on UDP {PORT}")
+        return True
+    except OSError as e:
+        print(f"[server] could not bind UDP {PORT}: {e}")
+        sock = None
+        return False
 
-        def set_nonblocking(self, flag):
+
+def close_udp():
+    global sock
+    if sock is not None:
+        try:
+            sock.close()
+        except Exception:
             pass
+        sock = None
 
-        def read(self, n):
-            try:
-                return list(os.read(self._fd, n))
-            except BlockingIOError:
-                return []
 
-        def close(self):
-            os.close(self._fd)
+class _RawHidShim:
+    """Minimal os-level hidraw reader with hidapi-compatible .read()."""
+    def __init__(self, node):
+        self._fd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
 
-    def _linux_hidraw_node(vid, pid):
-        """Resolve /dev/hidrawN for a USB HID device via sysfs (Linux only)."""
-        import glob
-        for uevent in glob.glob('/sys/class/hidraw/hidraw*/device/uevent'):
-            try:
-                with open(uevent) as f:
-                    for line in f:
-                        if line.startswith("HID_ID="):
-                            parts = line.strip().split("=", 1)[1].split(":")
-                            if len(parts) == 3 and int(parts[1], 16) == vid \
-                                    and int(parts[2], 16) == pid:
-                                # uevent path: .../class/hidraw/hidrawN/device/uevent
-                                node = uevent.split("/")[4]
-                                return f"/dev/{node}"
-                        if line.startswith("DRIVER="):
-                            break
-            except OSError:
-                continue
-        return None
+    def set_nonblocking(self, flag):
+        pass
 
+    def read(self, n):
+        try:
+            return list(os.read(self._fd, n))
+        except BlockingIOError:
+            return []
+
+    def close(self):
+        os.close(self._fd)
+
+
+def _linux_hidraw_node(vid, pid):
+    """Resolve /dev/hidrawN for a USB HID device via sysfs (Linux only)."""
+    import glob
+    for uevent in glob.glob('/sys/class/hidraw/hidraw*/device/uevent'):
+        try:
+            with open(uevent) as f:
+                for line in f:
+                    if line.startswith("HID_ID="):
+                        parts = line.strip().split("=", 1)[1].split(":")
+                        if len(parts) == 3 and int(parts[1], 16) == vid \
+                                and int(parts[2], 16) == pid:
+                            # uevent path: .../class/hidraw/hidrawN/device/uevent
+                            node = uevent.split("/")[4]
+                            return f"/dev/{node}"
+                    if line.startswith("DRIVER="):
+                        break
+        except OSError:
+            continue
+    return None
+
+
+def close_hid():
+    """Drop the dongle handle (safe to call repeatedly / on stale handles)."""
+    global hid_dev, _hid_part1
+    if hid_dev is not None:
+        try:
+            hid_dev.close()
+        except Exception:
+            pass
+        hid_dev = None
+    _hid_part1 = b""
+
+
+def open_hid():
+    """Open the dongle's vendor-defined HID interface. Returns False when the
+    dongle is absent or unopenable (caller stays in degraded/waiting state)."""
+    global hid_dev
+    if not HID_AVAILABLE:
+        return False
+    close_hid()
+    matches = [d for d in hidapi.enumerate(ARGS.vid, ARGS.pid)]
+    product = matches[0].get("product_string", "?") if matches else "?"
     devnode = ""
     for m in matches:                       # normal case; works on Windows/macOS
         try:
@@ -294,20 +350,96 @@ else:
                 hid_dev = cand
             except Exception:
                 pass
-    if hid_dev is not None:
-        print(f"Reading TUNNEL reports from dongle VID={ARGS.vid:#06x} "
-              f"PID={ARGS.pid:#06x} ({matches[0].get('product_string', '?')})")
-    else:
+    if hid_dev is None:
         # Last resort: bypass hidapi entirely.
         if not devnode:
             devnode = _linux_hidraw_node(ARGS.vid, ARGS.pid) or ""
-        if not devnode:
-            raise SystemExit(
-                f"Could not open dongle HID device ({ARGS.vid:#06x}/{ARGS.pid:#06x}). "
-                "Check permissions on the hidraw node.")
-        hid_dev = _RawHidShim(devnode)
-        print(f"(hidapi unusable; reading raw {devnode})")
-    hid_dev.set_nonblocking(1)
+        if devnode:
+            hid_dev = _RawHidShim(devnode)
+            print(f"[dongle] hidapi unusable; reading raw {devnode}")
+        else:
+            return False                    # not plugged in (or no perms)
+    try:
+        hid_dev.set_nonblocking(1)
+    except Exception:
+        pass
+    print(f"[dongle] opened VID={ARGS.vid:#06x} PID={ARGS.pid:#06x} ({product})")
+    return True
+
+
+def open_source(src):
+    return open_udp() if src == "udp" else open_hid()
+
+
+def refresh_source_status():
+    """Idle-state diagnostics text + color for the current source. Called on
+    boot/toggle/dongle state changes; update_gui() owns the per-frame text."""
+    offline = SOURCE == "hid" and dongle_offline
+    if offline:
+        diag_text.set(f"[DONGLE OFFLINE] waiting for ESP-NOW dongle "
+                      f"(VID={ARGS.vid:#06x} PID={ARGS.pid:#06x})...")
+    elif SOURCE == "hid":
+        diag_text.set(f"Waiting for TUNNEL reports from ESP-NOW dongle "
+                      f"(VID={ARGS.vid:#06x} PID={ARGS.pid:#06x})...")
+    else:
+        diag_text.set("Waiting for device HELLO broadcasts on UDP 4242...")
+    diag_label.configure(fg="#FF5555" if offline else "#00FF00")
+
+
+def set_source(new):
+    """Switch transports at runtime: closes the current link, opens the new
+    one, re-homes bound gloves back to pending (keeping cfg['mac_hand'] so
+    they auto-return on the new transport), persists the choice and updates
+    the GUI. Returns False if the new source could not be opened."""
+    global SOURCE, dongle_offline, _last_known_macs
+    new = str(new)
+    if new not in ("udp", "hid"):
+        return False
+    if new == SOURCE:
+        return True
+    if new == "hid" and not HID_AVAILABLE:
+        print("[source] hid mode unavailable - pip install hidapi")
+        refresh_source_status()
+        return False
+
+    close_udp()
+    close_hid()
+    SOURCE = new
+    # Pessimistic until the first open attempt reports back.
+    dongle_offline = (new == "hid")
+
+    for h in ("left", "right"):
+        hs = hands[h]
+        if hs.mac:
+            pending[hs.mac] = {"ip": hs.ip or "(dongle)", "fw": hs.fw,
+                               "channel_count": 12, "hand_hint": HAND_UNKNOWN,
+                               "last_seen": time.time()}
+        hs.mac = None
+        hs.ip = None
+        hs.filtered = [0] * 12
+        hs.touch = 0
+        hs.fdc_raw = [0] * 4
+        hs.sensor_type = SENSOR_NONE
+        hs.meta = {"i2c_ms": 0, "loop_ms": 0, "rssi": 0, "uptime": 0}
+        hs.reset_stream_state()
+    _last_known_macs = set()
+    rebuild_device_list()
+
+    ok = open_source(new)
+    if new == "udp":
+        dongle_offline = False
+    elif ok:
+        dongle_offline = False
+
+    cfg["source"] = new
+    save_config(cfg)
+    refresh_source_status()
+    if new == "udp":
+        print("[source] active: WiFi UDP :4242")
+    else:
+        print("[source] active: ESP-NOW dongle"
+              + ("" if ok else " (waiting for plug-in)"))
+    return ok
 
 
 def mac_bytes_to_str(b):
@@ -468,13 +600,35 @@ root.title("SloppyHands Tracker (v3 - dual hand + smoothing)")
 root.geometry("980x820")
 root.configure(bg="#222")
 
-diag_text = tk.StringVar()
-if SOURCE == "hid":
-    diag_text.set(f"Waiting for TUNNEL reports from ESP-NOW dongle (VID={ARGS.vid:#06x} PID={ARGS.pid:#06x})...")
-else:
-    diag_text.set("Waiting for device HELLO broadcasts on UDP 4242...")
+diag_text = tk.StringVar(value="Starting...")
 diag_label = tk.Label(root, textvariable=diag_text, bg="#222", fg="#00FF00", font=("Consolas", 10))
 diag_label.pack(fill=tk.X, pady=3)
+
+# --- Source selector: WiFi UDP <-> ESP-NOW dongle, switchable live ---------
+src_bar = tk.Frame(root, bg="#222")
+src_bar.pack(fill=tk.X, padx=10)
+tk.Label(src_bar, text="Data source:", bg="#222", fg="#888",
+         font=("Consolas", 9)).pack(side=tk.LEFT, padx=(0, 4))
+source_var = tk.StringVar(value="udp")
+_src_style = ttk.Style()
+_src_style.configure("Source.TRadiobutton", background="#222",
+                     foreground="#00FF00", font=("Consolas", 9),
+                     focuscolor="#222")
+_src_style.map("Source.TRadiobutton",
+               background=[("active", "#222"), ("disabled", "#222")],
+               foreground=[("disabled", "#666")])
+ttk.Radiobutton(src_bar, text="WiFi UDP", value="udp", variable=source_var,
+                command=lambda: set_source(source_var.get()),
+                style="Source.TRadiobutton").pack(side=tk.LEFT, padx=2)
+_rbt_hid = ttk.Radiobutton(src_bar, text="ESP-NOW dongle", value="hid",
+                           variable=source_var,
+                           command=lambda: set_source(source_var.get()),
+                           style="Source.TRadiobutton")
+_rbt_hid.pack(side=tk.LEFT, padx=2)
+if not HID_AVAILABLE:
+    _rbt_hid.configure(state="disabled")
+    tk.Label(src_bar, text="(pip install hidapi)", bg="#222", fg="#666",
+             font=("Consolas", 8)).pack(side=tk.LEFT, padx=2)
 
 # --- Device list ---
 dev_frame = tk.LabelFrame(root, text="Discovered devices", bg="#222", fg="#FFAA00",
@@ -762,13 +916,20 @@ for v in (baseline_var, max_delta_var, coupling_var,
 on_map_changed()
 
 # ---------------------------------------------------------------------------
-# FDC2214 calibration
+# Sensor calibration (per-hand, per-channel rest/flex capture)
+#
+# Both sensors read LOWER under flex (more capacitance -> smaller value), so
+# flex = clamp((baseline - raw) / delta, 0..1) works for MPR121 filtered
+# values and FDC2214 raw alike. Each hand stores its own table; channels with
+# delta <= 0 count as uncalibrated and fall back to the global sliders.
 # ---------------------------------------------------------------------------
-cal_tab = tk.Frame(bottom, bg="#222")
-bottom.add(cal_tab, text="FDC Calibrate")
+_cal = None  # pending calibration: {"hand", "mode", "sensor", "sums", "n", "deadline"}
+cal_status_var = tk.StringVar(value="Hand open -> Set Rest, make a fist -> Set Flex (per hand).")
 
-_cal = None  # pending calibration: {"hand", "mode", "sums", "n", "deadline"}
-cal_status_var = tk.StringVar(value="Relax -> Set Rest, then make a fist -> Set Flex (per hand).")
+_CAL_SENSORS = {
+    "fdc": {"type": SENSOR_FDC2214, "name": "FDC2214", "channels": 4,  "key": "fdc_cal"},
+    "mpr": {"type": SENSOR_MPR121,  "name": "MPR121",  "channels": 12, "key": "mpr_cal"},
+}
 
 
 def _cal_summary(hand_name):
@@ -778,45 +939,80 @@ def _cal_summary(hand_name):
     return "  ".join(f"ch{i}:B={int(base[i])} D={int(delta[i])}" for i in range(4))
 
 
+def _mpr_cal_summary(hand_name):
+    """12 channels won't fit one row: two rows of six, B/D per channel."""
+    cal = cfg["hands"][hand_name].get("mpr_cal", {})
+    base = cal.get("baseline", [])
+    delta = cal.get("delta", [])
+
+    def row(rng):
+        return " ".join(f"c{i}:{int(base[i]) if i < len(base) else 0}"
+                        f"/{int(delta[i]) if i < len(delta) else 0}" for i in rng)
+
+    return "\n".join([row(range(0, 6)), row(range(6, 12))])
+
+
 def _update_cal_labels():
-    cal_left_var.set(_cal_summary("left"))
-    cal_right_var.set(_cal_summary("right"))
+    for h in ("left", "right"):
+        fdc_vars[h].set(_cal_summary(h))
+        mpr_vars[h].set(_mpr_cal_summary(h))
 
 
-def _start_cal(hand_name, mode):
+def _start_cal(hand_name, mode, sensor):
     global _cal
+    spec = _CAL_SENSORS[sensor]
     hs = hands[hand_name]
-    if hs.sensor_type != SENSOR_FDC2214:
-        cal_status_var.set(f"{hand_name}: no active FDC2214 device (sensorType={hs.sensor_type}).")
+    if hs.sensor_type != spec["type"]:
+        cal_status_var.set(f"{hand_name}: no active {spec['name']} device (sensorType={hs.sensor_type}).")
         return
-    _cal = {"hand": hand_name, "mode": mode, "sums": [0.0] * 4, "n": 0,
+    _cal = {"hand": hand_name, "mode": mode, "sensor": sensor,
+            "sums": [0.0] * spec["channels"], "n": 0,
             "deadline": time.time() + 0.6}
-    cal_status_var.set(f"{hand_name}: capturing '{mode}' for 0.6 s...")
+    cal_status_var.set(f"{hand_name}: capturing '{mode}' ({spec['name']}) for 0.6 s...")
 
 
-def _fdc_cal_tick():
+def _reset_cal(hand_name, sensor):
+    global _cal
+    spec = _CAL_SENSORS[sensor]
+    # Abort an in-flight capture so it can't re-populate the table below.
+    if _cal and _cal["hand"] == hand_name and _cal["sensor"] == sensor:
+        _cal = None
+    n = spec["channels"]
+    cfg["hands"][hand_name][spec["key"]] = {
+        "baseline": [0.0] * n, "flexed": [0.0] * n, "delta": [0.0] * n}
+    save_config(cfg)
+    _update_cal_labels()
+    cal_status_var.set(f"{hand_name}: {spec['name']} calibration cleared "
+                       f"(falls back to {'global sliders' if sensor == 'mpr' else 'zero flex'}).")
+
+
+def _cal_tick():
     global _cal
     if _cal is None:
         return
+    spec = _CAL_SENSORS[_cal["sensor"]]
     hs = hands[_cal["hand"]]
-    if hs.sensor_type != SENSOR_FDC2214 or not hs.is_alive():
+    if hs.sensor_type != spec["type"] or not hs.is_alive():
         cal_status_var.set(f"{_cal['hand']}: calibration aborted (device lost).")
         _cal = None
         return
-    for ch in range(4):
-        _cal["sums"][ch] += hs.fdc_raw[ch]
+    samples = hs.fdc_raw if _cal["sensor"] == "fdc" else hs.filtered
+    for ch in range(spec["channels"]):
+        _cal["sums"][ch] += samples[ch]
     _cal["n"] += 1
     if time.time() < _cal["deadline"]:
         return
     avg = [s / _cal["n"] for s in _cal["sums"]]
-    cal = cfg["hands"][_cal["hand"]].setdefault(
-        "fdc_cal", {"baseline": [0, 0, 0, 0], "flexed": [0, 0, 0, 0], "delta": [0, 0, 0, 0]})
+    blank = json.loads(json.dumps({"baseline": [0.0] * spec["channels"],
+                                   "flexed": [0.0] * spec["channels"],
+                                   "delta": [0.0] * spec["channels"]}))
+    cal = cfg["hands"][_cal["hand"]].setdefault(spec["key"], blank)
     if _cal["mode"] == "rest":
         cal["baseline"] = avg
         cal_status_var.set(f"{_cal['hand']}: rest baseline captured. Now flex and press Set Flex.")
     else:
         cal["flexed"] = avg
-        for ch in range(4):
+        for ch in range(spec["channels"]):
             cal["delta"][ch] = max(0.0, cal["baseline"][ch] - avg[ch])
         cal_status_var.set(f"{_cal['hand']}: flex captured; deltas computed.")
     save_config(cfg)
@@ -824,22 +1020,36 @@ def _fdc_cal_tick():
     _cal = None
 
 
-cal_left_var = tk.StringVar(value="")
-cal_right_var = tk.StringVar(value="")
-tk.Label(cal_tab, textvariable=cal_status_var, bg="#222", fg="#FFAA00", font=("Consolas", 9)).grid(
-    row=0, column=0, columnspan=2, sticky="w", pady=4)
-for ri, hand_name in enumerate(("left", "right")):
-    frm = tk.Frame(cal_tab, bg="#222")
-    frm.grid(row=1 + ri, column=0, sticky="w", padx=6, pady=4)
-    tk.Button(frm, text=f"{hand_name}: Set Rest",
-              command=lambda h=hand_name: _start_cal(h, "rest"), bg="#333", fg="#00FF00").pack(side=tk.LEFT, padx=2)
-    tk.Button(frm, text="Set Flex",
-              command=lambda h=hand_name: _start_cal(h, "flex"), bg="#333", fg="#00FF00").pack(side=tk.LEFT, padx=2)
+def _build_cal_tab(sensor):
+    """One notebook tab per sensor front-end; same buttons, own summary labels."""
+    spec = _CAL_SENSORS[sensor]
+    tab = tk.Frame(bottom, bg="#222")
+    tk.Label(tab, textvariable=cal_status_var, bg="#222", fg="#FFAA00",
+             font=("Consolas", 9)).grid(row=0, column=0, columnspan=2, sticky="w", pady=4)
+    out_vars = {}
+    for ri, hand_name in enumerate(("left", "right")):
+        frm = tk.Frame(tab, bg="#222")
+        frm.grid(row=1 + ri, column=0, sticky="w", padx=6, pady=4)
+        tk.Button(frm, text=f"{hand_name}: Set Rest",
+                  command=lambda h=hand_name: _start_cal(h, "rest", sensor),
+                  bg="#333", fg="#00FF00").pack(side=tk.LEFT, padx=2)
+        tk.Button(frm, text="Set Flex",
+                  command=lambda h=hand_name: _start_cal(h, "flex", sensor),
+                  bg="#333", fg="#00FF00").pack(side=tk.LEFT, padx=2)
+        tk.Button(frm, text="Reset Cal",
+                  command=lambda h=hand_name: _reset_cal(h, sensor),
+                  bg="#333", fg="#FFAA00").pack(side=tk.LEFT, padx=2)
+        v = tk.StringVar(value="")
+        out_vars[hand_name] = v
+        tk.Label(tab, textvariable=v, bg="#222", fg="#00FF00",
+                 font=("Consolas", 9), justify=tk.LEFT).grid(row=1 + ri, column=1, sticky="w", padx=10)
+    bottom.add(tab, text=f"{spec['name']} Calibrate")
+    return out_vars
+
+
+fdc_vars = _build_cal_tab("fdc")
+mpr_vars = _build_cal_tab("mpr")
 _update_cal_labels()
-tk.Label(cal_tab, textvariable=cal_left_var, bg="#222", fg="#00FF00", font=("Consolas", 9)).grid(
-    row=1, column=1, sticky="w", padx=10)
-tk.Label(cal_tab, textvariable=cal_right_var, bg="#222", fg="#00FF00", font=("Consolas", 9)).grid(
-    row=2, column=1, sticky="w", padx=10)
 
 # ---------------------------------------------------------------------------
 # Serial Console tab
@@ -1025,8 +1235,17 @@ def normalize_joint(hand_state, joint_key):
         if not (0 <= ch < 12):
             return 0.0
         raw = hand_state.filtered[ch]
-        delta = max(0, baseline_var.get() - raw)
-        norm = min(1.0, delta / max(1, max_delta_var.get()))
+        # Per-channel MPR calibration when present; global sliders otherwise.
+        cal = cfg["hands"][hand_state.name].get("mpr_cal", {})
+        base_l = cal.get("baseline", [])
+        delta_l = cal.get("delta", [])
+        cbase = base_l[ch] if ch < len(base_l) else 0.0
+        cdelta = delta_l[ch] if ch < len(delta_l) else 0.0
+        if cdelta > 0:
+            norm = max(0.0, min(1.0, (cbase - raw) / cdelta))
+        else:
+            delta = max(0, baseline_var.get() - raw)
+            norm = min(1.0, delta / max(1, max_delta_var.get()))
     sm = hand_state.smoothers[joint_key]
     return sm.update(norm,
                      smooth_alpha_var.get(),
@@ -1047,7 +1266,22 @@ def _bars_for(hs):
                 norm = max(0.0, min(1.0, (base[i] - hs.fdc_raw[i]) / delta[i]))
                 bars[i] = int(norm * 120)
         return bars
-    return hs.filtered
+    cal = cfg["hands"][hs.name].get("mpr_cal", {})
+    base = cal.get("baseline", [])
+    delta = cal.get("delta", [])
+    if not any(i < len(delta) and delta[i] > 0 for i in range(12)):
+        return hs.filtered          # nothing calibrated: legacy raw scaling
+    bars = [0] * 12
+    for i in range(12):
+        d = delta[i] if i < len(delta) else 0
+        b = base[i] if i < len(base) else 0
+        if d > 0:
+            norm = max(0.0, min(1.0, (b - hs.filtered[i]) / d))
+            bars[i] = int(norm * 120)
+        else:
+            # channel not calibrated: keep raw height so gaps are visible
+            bars[i] = min(120, max(0, hs.filtered[i] // 4))
+    return bars
 
 
 class HandView:
@@ -1259,6 +1493,17 @@ right_view.set_skeleton_visible(False)
 left_view.set_skeleton_visible(False)
 
 
+# --- Resolve boot source: CLI flag > saved config > UDP --------------------
+# Lives here (not up with the widgets) because set_source() re-homes hand
+# slots and rebuilds the device table, which only exist past this point.
+_boot = ARGS.source if ARGS.source in ("udp", "hid") else cfg.get("source", "udp")
+if _boot not in ("udp", "hid"):
+    _boot = "udp"
+if _boot == "hid" and not HID_AVAILABLE:
+    print("[boot] hid source requested but hidapi is missing - falling back to UDP")
+    _boot = "udp"
+set_source(_boot)   # opens the transport (and persists the choice)
+
 # ---------------------------------------------------------------------------
 # Packet handling
 # ---------------------------------------------------------------------------
@@ -1343,9 +1588,21 @@ def ingest_hid_reports():
     ID 2 is 63 bytes there (1 id + 62, vs 1 + 20 on Linux). Slice to
     TUNNEL_PART2_LEN and accept any length >= that so both backends work.
     """
-    global _hid_part1
+    global _hid_part1, dongle_offline
+    if hid_dev is None:
+        return          # degraded/waiting: the watchdog will open the device
     while True:
-        report = hid_dev.read(96)
+        try:
+            report = hid_dev.read(96)
+        except Exception as e:
+            # Handle died under us (unplug / backend hiccup). Drop it and let
+            # the presence watchdog reopen once the device enumerates again -
+            # letting this propagate would kill the update_gui after-loop.
+            print(f"[dongle] read failed ({e}); dropping handle until replug.")
+            close_hid()
+            dongle_offline = True
+            refresh_source_status()
+            return
         if not report:
             break
         if not isinstance(report, (bytes, bytearray)):
@@ -1465,9 +1722,33 @@ def handle_packet(data, addr):
             target.last_packet_id = packet_id
 
 
+def _dongle_watchdog(now):
+    """~1 Hz dongle presence poll (HID mode only): opens the device when it
+    enumerates, drops the handle when it disappears. Covers unplug/replug
+    including backends whose read() never raises."""
+    global dongle_offline, _last_dongle_poll
+    if SOURCE != "hid":
+        return
+    if now - _last_dongle_poll < 1.0:
+        return
+    _last_dongle_poll = now
+    present = bool(hidapi.enumerate(ARGS.vid, ARGS.pid)) if HID_AVAILABLE else False
+    if present and hid_dev is None:
+        if open_hid():
+            dongle_offline = False
+            refresh_source_status()
+            print("[dongle] connected.")
+    elif not present and hid_dev is not None:
+        close_hid()
+        dongle_offline = True
+        refresh_source_status()
+        print("[dongle] DISCONNECTED - waiting for re-plug...")
+
+
 def update_gui():
     # 1) drain inbound frames from the active source
     if SOURCE == "hid":
+        _dongle_watchdog(time.time())
         ingest_hid_reports()
     else:
         while True:
@@ -1477,7 +1758,7 @@ def update_gui():
                 break
             handle_packet(raw_bytes, addr)
 
-    _fdc_cal_tick()
+    _cal_tick()
 
     # 2) sweep dead sessions (UDP only: HELLO re-handshake restores them).
     # In HID mode the dongle owns device-side liveness, so we never unbind
@@ -1521,7 +1802,10 @@ def update_gui():
                          f"i2c={hs.meta['i2c_ms']}ms loop={hs.meta['loop_ms']}ms")
         else:
             parts.append(f"{h.upper()}:--")
-    diag_text.set("  |  ".join(parts))
+    offline = SOURCE == "hid" and dongle_offline
+    diag_text.set(("[DONGLE OFFLINE - plug it in to resume] " if offline else "")
+                  + "  |  ".join(parts))
+    diag_label.configure(fg="#FF5555" if offline else "#00FF00")
 
     # 5) render -- pre-allocated items, just coords() updates
     render_right(hands["right"], get_vr_flex())
@@ -1549,8 +1833,8 @@ def on_closing():
             openvr.shutdown()
     except Exception:
         pass
-    if sock:
-        sock.close()
+    close_hid()
+    close_udp()
     root.destroy()
 
 
