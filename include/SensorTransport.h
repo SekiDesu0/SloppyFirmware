@@ -2,7 +2,7 @@
 #include <Arduino.h>
 #include "PacketIO.h"
 
-// Transport abstraction so the glove state machine can run unchanged over
+// Transport abstraction so the tracker state machine can run unchanged over
 // UDP/WiFi (Discovery) or ESP-NOW to the HID dongle (EspNowTransport).
 class SensorTransport {
 public:

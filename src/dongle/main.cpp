@@ -1,11 +1,11 @@
 // SloppyFirmware v5 - ESP32-S3 HID dongle
 //
 // Plugs into the PC over USB: vendor-defined HID input reports carrying
-// TUNNEL frames (DATA payload + source MAC/RSSI) from paired gloves.
+// TUNNEL frames (DATA payload + source MAC/RSSI) from paired trackers.
 //
-// Radio side: listens for ESP-NOW HELLO broadcasts from gloves, answers with
+// Radio side: listens for ESP-NOW HELLO broadcasts from trackers, answers with
 // WELCOME, then streams KEEPALIVEs and forwards their DATA frames to the PC.
-// One fixed Wi-Fi channel (persisted in NVS); gloves hop channels to find us.
+// One fixed Wi-Fi channel (persisted in NVS); trackers hop channels to find us.
 //
 // USB side uses the Arduino core's native TinyUSB stack (USBHID classes) - no
 // external TinyUSB library, so two copies of the stack can never fight over
@@ -44,8 +44,13 @@
 #define DONGLE_PEER_TIMEOUT_MS 5000
 #endif
 
+// Run CPU at 80 MHz instead of 240: non-heatsink builds run hot, and the
+// workload (forwarding ~8 KB/s of tracker frames to USB HID) barely needs
+// cycles. TinyUSB's 48 MHz PHY clock is independent of the CPU frequency.
+static constexpr unsigned long CPU_FREQ_MHZ = 80;
+
 // --- USB HID -----------------------------------------------------------------
-// Full-speed interrupt endpoints cap at 64 bytes/transaction, so each 82-byte
+// Full-speed interrupt endpoints cap at 64 bytes/transaction, so each 85-byte
 // TUNNEL frame ships as two input reports:
 //   Report ID 1 : first 62 bytes of TunnelPacket
 //   Report ID 2 : remaining sizeof(TunnelPacket)-62 bytes
@@ -72,7 +77,7 @@ static const uint8_t hidReportDescriptor[] = {
     0x15, 0x00,                     //   Logical Minimum (0)
     0x26, 0xFF, 0x00,               //   Logical Maximum (255)
     0x75, 0x08,                     //   Report Size (8 bits)
-    0x95, HID_PART2_LEN,            //   Report Count (18)
+    0x95, HID_PART2_LEN,            //   Report Count (23)
     0x81, 0x02,                     //   Input (Data, Variable, Absolute)
 
     0xC0                            // End Collection
@@ -196,7 +201,7 @@ static void handleFrame(const RxFrame& f) {
             p->active       = true;
             TunnelPacket t;
             PacketIO::buildTunnel(t, f.mac, f.rssi, d);
-            // Ship as two input reports (62 + 20 bytes). SendReport() blocks
+            // Ship as two input reports (62 + 23 bytes). SendReport() blocks
             // until the host has taken the previous report, so back-to-back
             // calls cannot interleave: if part 1 fails to queue within its
             // timeout, part 2 never goes out and the whole frame is dropped
@@ -287,7 +292,7 @@ static void logf(const char* fmt, ...) {
 // --- Console CLI -----------------------------------------------------------------
 // Lives on the USB CDC interface only: the dongle hangs off a single USB
 // cable, so UART0 stays a logs-only escape hatch for bench debugging. Same
-// conventions as the glove CLI: local echo, backspace/DEL editing, '> '
+// conventions as the tracker CLI: local echo, backspace/DEL editing, '> '
 // prompt. All output goes through cdcOut(), so it works even when the host
 // keeps DTR low; the banner prints on DTR rise or on the first keystroke.
 static String cliLine;
@@ -297,10 +302,9 @@ static bool   cliLastWasCR = false;
 static void cliHelp() {
     cliPrintln("Commands:");
     cliPrintln("  status       FW / channel / peer summary");
-    cliPrintln("  list         Known glove peers (age, RSSI, last packet)");
+    cliPrintln("  list         Known tracker peers (age, RSSI, last packet)");
     cliPrintln("  channel <n>  Set ESP-NOW Wi-Fi channel, persist & reboot");
-    cliPrintln("  forget       Drop the in-RAM peer table (gloves re-pair)");
-    cliPrintln("  pair clear   Alias for 'forget'");
+    cliPrintln("  forget       Drop the in-RAM peer table (trackers re-pair)");
     cliPrintln("  reset        Soft-reset the dongle");
     cliPrintln("  help         Show this message");
 }
@@ -356,7 +360,7 @@ static void cliExec(const String& line) {
         return;
     }
 
-    if (t == "forget" || t == "pair clear") {
+    if (t == "forget") {
         peerCount = 0;
         memset(peers, 0, sizeof(peers));
         cliPrintln("Peer table dropped. Gloves will re-pair.");
@@ -426,10 +430,13 @@ void setup() {
     // as a second console over the same cable.
     Serial.begin(115200);
 
+    setCpuFrequencyMhz(CPU_FREQ_MHZ);
+
     led.begin(DONGLE_RGB_LED);
     led.setState(DeviceState::Discovering);
 
-    logf("[BOOT] SloppyHands dongle FW%u\r\n", cfg::FW_VERSION);
+    logf("[BOOT] SloppyHands dongle FW%u cpu=%luMHz\r\n",
+         cfg::FW_VERSION, (unsigned long)getCpuFrequencyMhz());
 
     Preferences prefs;
     prefs.begin("dongle", true);

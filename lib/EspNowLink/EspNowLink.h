@@ -8,7 +8,7 @@
 // poll() from loop(): RX callbacks fire in the WiFi stack context, so they
 // only push into an internal ring buffer here.
 //
-// Used by the gloves (via EspNowTransport) and by the HID dongle directly.
+// Used by the trackers (via EspNowTransport) and by the HID dongle directly.
 
 struct RxFrame {
     uint8_t  mac[6];        // sender MAC

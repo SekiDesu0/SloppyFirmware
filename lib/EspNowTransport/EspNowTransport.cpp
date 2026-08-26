@@ -65,7 +65,7 @@ PacketType EspNowTransport::pump(WelcomePacket& welcomeOut, KeepalivePacket& kee
                 }
                 break;
             default:
-                break;      // HELLO/DATA/TUNNEL not for gloves
+                break;      // HELLO/DATA/TUNNEL not for trackers
         }
     }
     return static_cast<PacketType>(0);

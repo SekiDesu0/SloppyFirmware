@@ -1,5 +1,6 @@
-// SloppyFirmware v2
-// Reads all 12 MPR121 electrodes and streams them to a server over UDP.
+// SloppyFirmware v6
+// Reads all 12 MPR121 electrodes (or 4 FDC2214 channels) and streams them to
+// a server over UDP or ESP-NOW, with battery gauge in the DATA frames.
 //
 // State machine: PROVISIONING -> CONNECTING -> DISCOVERING -> STREAMING
 // Provisioning waits for serial `wifi set <ssid> <pass>` if no creds stored.
@@ -22,6 +23,7 @@ static constexpr unsigned long CPU_FREQ_MHZ = 80;
 #include "SerialCLI.h"
 #include "SensorMPR121.h"
 #include "SensorFDC2214.h"
+#include "BatteryMonitor.h"
 #include "Discovery.h"
 #include "EspNowTransport.h"
 #include "PacketIO.h"
@@ -32,6 +34,7 @@ static constexpr unsigned long CPU_FREQ_MHZ = 80;
 WifiManager   wifi;
 SensorMPR121  sensor;
 SensorFDC2214 fdcSensor;
+BatteryMonitor battery;
 StatusLED     led;
 Discovery     discovery;
 EspNowTransport espnowLink;
@@ -191,6 +194,11 @@ void setup() {
     }
     led.setSensorAbsent(sensorType == cfg::SENSOR_TYPE_NONE);
 
+    battery.begin();
+    Serial.printf("[BOOT] Battery monitor: %s (pin %d)\r\n",
+        battery.enabled() ? "enabled" : "disabled",
+        cfg::BATT_ADC_PIN);
+
     if (activeTransport == cfg::TRANSPORT_ESPNOW) {
         // ESP-NOW mode: no WiFi credentials needed; pair with the dongle.
         transportPtr = &espnowLink;
@@ -330,9 +338,11 @@ static void loopStreaming() {
         }
         i2cMs = (uint16_t)(millis() - i2cStart);
         uint16_t loopMs = (uint16_t)(millis() - loopStart);
+        uint8_t battPct  = battery.read();
+        uint16_t battMv  = battery.milliVolts();
         DataPacket p;
         PacketIO::buildData(p, packetId++, filtered, touch, fdcRaw, sensorType,
-                            i2cMs, loopMs, wifi.rssi());
+                            i2cMs, loopMs, wifi.rssi(), battMv, battPct);
         transportPtr->sendData(p);
         lastFrameMs = now;
     } else {

@@ -15,7 +15,7 @@ void SerialCLI::begin(StatusFn statusFn, WifiSetFn wifiSetFn, WifiClearFn wifiCl
     _i2cScanFn      = i2cScanFn;
     _started = true;
     Serial.println();
-    Serial.println("SloppyFirmware v5 - serial CLI ready.");
+    Serial.println("SloppyFirmware v6 - serial CLI ready.");
     _help();
     Serial.print("> ");
 }

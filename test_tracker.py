@@ -72,21 +72,24 @@ WELCOME_FMT = HEADER_FMT + "HH"
 # Data (v3, fw<4): header + packetId(I) uptime(I) filtered(12H) touch(H) i2c(H) loop(H) rssi(b) reserved(B) = 48
 DATA_FMT_V3 = HEADER_FMT + "II12HHHHbB"
 DATA_LEN_V3 = struct.calcsize(DATA_FMT_V3)
-# Data (v4, fw>=4): header + packetId(I) uptime(I) filtered(12H) touch(H) fdcRaw(4I)
+# Data (v4, fw 4..5): header + packetId(I) uptime(I) filtered(12H) touch(H) fdcRaw(4I)
 #                    sensorType(B) reserved2(B) i2c(H) loop(H) rssi(b) reserved3(B) = 66
-DATA_FMT = HEADER_FMT + "II12HH4IBBHHbB"
+DATA_FMT_V4 = HEADER_FMT + "II12HH4IBBHHbB"
+DATA_LEN_V4 = struct.calcsize(DATA_FMT_V4)
+# Data (v6, fw>=6): v4 + battery: divider-compensated cell mV (H) + percent (B) = 69
+DATA_FMT = HEADER_FMT + "II12HH4IBBHHbBHB"
 DATA_LEN = struct.calcsize(DATA_FMT)
 # Keepalive: header + lastSeenPacketId(I) = 12
 KEEP_FMT = HEADER_FMT + "I"
 
 # Tunnel (dongle -> PC over HID): header + mac(6s) + rssi(b) + reserved(B),
-# followed by an embedded DATA packet. 16 + 66 = 82 bytes.
+# followed by an embedded DATA packet. 16 + 69 = 85 bytes.
 TUNNEL_FMT = HEADER_FMT + "6sbB"
 TUNNEL_HDR_LEN = struct.calcsize(TUNNEL_FMT)
 TUNNEL_LEN = TUNNEL_HDR_LEN + DATA_LEN
 
-# The dongle splits each 82-byte TUNNEL frame across two HID input reports
-# (report ID 1 = first 62 bytes, report ID 2 = remaining 20) because a
+# The dongle splits each 85-byte TUNNEL frame across two HID input reports
+# (report ID 1 = first 62 bytes, report ID 2 = remaining 23) because a
 # full-speed interrupt endpoint caps at 64 bytes/transaction. hidraw (Linux)
 # returns each report at its exact size; Windows' HID class driver instead
 # pads every report to the largest report size (62), so report ID 2 arrives
@@ -100,8 +103,8 @@ KEEP_LEN = struct.calcsize(KEEP_FMT)
 
 # ---------------------------------------------------------------------------
 # CLI: choose where sensor frames come from
-#   --source udp  classic path, gloves stream straight to this PC over WiFi
-#   --source hid  gloves stream over ESP-NOW to the S3 dongle; this PC reads
+#   --source udp  classic path, trackers stream straight to this PC over WiFi
+#   --source hid  trackers stream over ESP-NOW to the S3 dongle; this PC reads
 #                 TUNNEL reports from its vendor-defined HID interface
 # ---------------------------------------------------------------------------
 DONGLE_VID_DEFAULT = 0x303A   # Espressif
@@ -388,7 +391,7 @@ def refresh_source_status():
 
 def set_source(new):
     """Switch transports at runtime: closes the current link, opens the new
-    one, re-homes bound gloves back to pending (keeping cfg['mac_hand'] so
+    one, re-homes bound trackers back to pending (keeping cfg['mac_hand'] so
     they auto-return on the new transport), persists the choice and updates
     the GUI. Returns False if the new source could not be opened."""
     global SOURCE, dongle_offline, _last_known_macs
@@ -405,6 +408,7 @@ def set_source(new):
     close_udp()
     close_hid()
     SOURCE = new
+    source_var.set(new)
     # Pessimistic until the first open attempt reports back.
     dongle_offline = (new == "hid")
 
@@ -495,7 +499,8 @@ class HandState:
         self.touch = 0
         self.fdc_raw = [0] * 4
         self.sensor_type = SENSOR_NONE
-        self.meta = {"i2c_ms": 0, "loop_ms": 0, "rssi": 0, "uptime": 0}
+        self.meta = {"i2c_ms": 0, "loop_ms": 0, "rssi": 0, "uptime": 0,
+                     "batt_mv": None, "batt_pct": None}
         joint_names = [k for k, _ in JOINT_KEYS]
         self.smoothers = {k: Smoother() for k in joint_names}
 
@@ -649,13 +654,13 @@ _dev_style.map("Treeview", background=[("selected", "#333")],
 _dev_style.map("Treeview.Heading", background=[("active", "#222")])
 
 dev_tree = ttk.Treeview(
-    dev_frame, columns=("mac", "ip", "fw", "ch", "hand", "rssi", "last"),
+    dev_frame, columns=("mac", "ip", "fw", "ch", "hand", "rssi", "batt", "last"),
     show="headings", height=4, selectmode="none")
 for _key, _txt, _w, _anchor in (
         ("mac", "MAC", 140, "w"), ("ip", "IP", 120, "w"),
         ("fw", "FW", 45, "w"), ("ch", "Ch", 40, "w"),
         ("hand", "Hand", 75, "center"), ("rssi", "RSSI", 80, "w"),
-        ("last", "Last", 65, "w")):
+        ("batt", "Batt", 55, "center"), ("last", "Last", 65, "w")):
     dev_tree.heading(_key, text=_txt, anchor=_anchor)
     dev_tree.column(_key, width=_w, minwidth=_w, anchor=_anchor, stretch=False)
 dev_tree.pack(fill=tk.X)
@@ -759,7 +764,7 @@ def rebuild_device_list():
     for mac in sorted(all_macs - existing):
         # iid == mac so lookups are direct; values refreshed per-frame
         dev_tree.insert("", "end", iid=mac,
-                        values=(mac, "", "", "", "auto", "-", "-"))
+                        values=(mac, "", "", "", "auto", "-", "-", "-"))
     for i, mac in enumerate(sorted(all_macs)):
         dev_tree.move(mac, "", i)
     # fit the table to its contents so there's no dead space below
@@ -794,11 +799,20 @@ def refresh_device_values():
             rssi_txt = f"{hand_state.meta['rssi']}dBm"
         else:
             rssi_txt = "-"
+        # Battery: only meaningful from fw>=6 trackers; 255 = unknown/disabled.
+        batt_pct = hand_state.meta.get("batt_pct") if hand_state is not None else None
+        if hand_state is not None and hand_state.is_alive() \
+                and hand_state.fw >= 6 \
+                and isinstance(batt_pct, int) and batt_pct != 255:
+            batt_txt = f"{batt_pct}%"
+        else:
+            batt_txt = "-"
         dev_tree.set(mac, "ip", ip_txt)
         dev_tree.set(mac, "fw", fw_txt)
         dev_tree.set(mac, "ch", ch_txt)
         dev_tree.set(mac, "hand", cur or "auto")
         dev_tree.set(mac, "rssi", rssi_txt)
+        dev_tree.set(mac, "batt", batt_txt)
         dev_tree.set(mac, "last", f"{elapsed:0.1f}s")
 
 
@@ -1508,15 +1522,25 @@ set_source(_boot)   # opens the transport (and persists the choice)
 # Packet handling
 # ---------------------------------------------------------------------------
 def parse_data_fields(data):
-    """Unpack a DATA packet (v4 fw, or legacy v3). Returns a tuple
+    """Unpack a DATA packet (v6 fw>=6, legacy v4 fw5, or ancient v3).
+    Returns a tuple
     (packet_id, uptime, filtered, touch, fdc_raw, sensor_type,
-     i2c_ms, loop_ms, rssi) or None if malformed."""
+     i2c_ms, loop_ms, rssi, batt_mv, batt_pct) or None if malformed."""
     if len(data) >= DATA_LEN:
         fields = struct.unpack(DATA_FMT, data[:DATA_LEN])
         return (
             fields[4], fields[5],
             list(fields[6:18]), fields[18], list(fields[19:23]),
             fields[23], fields[25], fields[26], fields[27],
+            fields[29], fields[30],
+        )
+    if len(data) >= DATA_LEN_V4:
+        fields = struct.unpack(DATA_FMT_V4, data[:DATA_LEN_V4])
+        return (
+            fields[4], fields[5],
+            list(fields[6:18]), fields[18], list(fields[19:23]),
+            fields[23], fields[25], fields[26], fields[27],
+            None, None,
         )
     if len(data) >= DATA_LEN_V3:
         fields = struct.unpack(DATA_FMT_V3, data[:DATA_LEN_V3])
@@ -1524,6 +1548,7 @@ def parse_data_fields(data):
             fields[4], fields[5],
             list(fields[6:18]), fields[18], [0, 0, 0, 0],
             SENSOR_MPR121, fields[19], fields[20], fields[21],
+            None, None,
         )
     return None
 
@@ -1562,7 +1587,8 @@ def deliver_data_mac(mac_str, parsed, dongle_rssi=None, fw=0):
 
     if target is None:
         return
-    packet_id, uptime, filtered, touch, fdc_raw, sensor_type, i2c_ms, loop_ms, rssi = parsed
+    packet_id, uptime, filtered, touch, fdc_raw, sensor_type, i2c_ms, loop_ms, \
+        rssi, batt_mv, batt_pct = parsed
     if dongle_rssi:                       # prefer the dongle's measurement
         rssi = dongle_rssi
     if not target.fw:
@@ -1571,7 +1597,8 @@ def deliver_data_mac(mac_str, parsed, dongle_rssi=None, fw=0):
     target.touch = touch
     target.fdc_raw = fdc_raw
     target.sensor_type = sensor_type
-    target.meta = {"i2c_ms": i2c_ms, "loop_ms": loop_ms, "rssi": rssi, "uptime": uptime}
+    target.meta = {"i2c_ms": i2c_ms, "loop_ms": loop_ms, "rssi": rssi,
+                   "uptime": uptime, "batt_mv": batt_mv, "batt_pct": batt_pct}
     target.last_seen = time.time()
     if packet_id > target.last_packet_id:
         target.last_packet_id = packet_id
@@ -1682,7 +1709,8 @@ def handle_packet(data, addr):
         parsed = parse_data_fields(data)
         if parsed is None:
             return
-        packet_id, uptime, filtered, touch, fdc_raw, sensor_type, i2c_ms, loop_ms, rssi = parsed
+        packet_id, uptime, filtered, touch, fdc_raw, sensor_type, i2c_ms, loop_ms, \
+            rssi, batt_mv, batt_pct = parsed
         # find which hand slot owns the sender by ip
         target = None
         for h in ("left", "right"):
@@ -1716,7 +1744,10 @@ def handle_packet(data, addr):
         target.touch = touch
         target.fdc_raw = fdc_raw
         target.sensor_type = sensor_type
-        target.meta = {"i2c_ms": i2c_ms, "loop_ms": loop_ms, "rssi": rssi, "uptime": uptime}
+        target.meta = {"i2c_ms": i2c_ms, "loop_ms": loop_ms, "rssi": rssi,
+                       "uptime": uptime, "batt_mv": batt_mv, "batt_pct": batt_pct}
+        if fw > target.fw:
+            target.fw = fw          # needed to gate fw>=6 features like battery
         target.last_seen = time.time()
         if packet_id > target.last_packet_id:
             target.last_packet_id = packet_id
@@ -1796,10 +1827,15 @@ def update_gui():
     for h in ("left", "right"):
         hs = hands[h]
         if hs.is_alive():
+            batt_pct = hs.meta.get("batt_pct")
+            batt_txt = ""
+            if hs.fw >= 6 and isinstance(batt_pct, int) and batt_pct != 255:
+                batt_txt = f" bat={batt_pct}%"
             parts.append(f"{h.upper()}:{hs.mac} id={hs.last_packet_id} "
                          f"sensor={SENSOR_LABELS.get(hs.sensor_type, '?')} "
                          f"rssi={hs.meta['rssi']}dBm "
-                         f"i2c={hs.meta['i2c_ms']}ms loop={hs.meta['loop_ms']}ms")
+                         f"i2c={hs.meta['i2c_ms']}ms loop={hs.meta['loop_ms']}ms"
+                         + batt_txt)
         else:
             parts.append(f"{h.upper()}:--")
     offline = SOURCE == "hid" and dongle_offline
