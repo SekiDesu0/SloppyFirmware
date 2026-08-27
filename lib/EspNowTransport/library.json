@@ -1,0 +1,11 @@
+{
+    "name": "EspNowTransport",
+    "version": "1.0.0",
+    "description": "SensorTransport implementation over ESP-NOW (tracker -> HID dongle)",
+    "frameworks": ["arduino"],
+    "platforms": ["espressif8266", "espressif32"],
+    "dependencies": [
+        { "name": "PacketIO" },
+        { "name": "EspNowLink" }
+    ]
+}

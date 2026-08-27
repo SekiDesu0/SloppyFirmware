@@ -10,8 +10,14 @@ public:
     using WifiClearFn = void (*)();
     using HandSetFn  = void (*)(uint8_t hand);
     using SensorSetFn = void (*)(uint8_t mode);
+    using TransportSetFn = void (*)(uint8_t transport);
+    using PairClearFn = void (*)();
+    using I2cScanFn   = void (*)();
     void begin(StatusFn statusFn, WifiSetFn wifiSetFn, WifiClearFn wifiClearFn,
-               HandSetFn handSetFn, SensorSetFn sensorSetFn);
+               HandSetFn handSetFn, SensorSetFn sensorSetFn,
+               TransportSetFn transportSetFn = nullptr,
+               PairClearFn pairClearFn = nullptr,
+               I2cScanFn i2cScanFn = nullptr);
     void update();
 
 private:
@@ -21,6 +27,9 @@ private:
     WifiClearFn   _wifiClearFn = nullptr;
     HandSetFn     _handSetFn  = nullptr;
     SensorSetFn   _sensorSetFn = nullptr;
+    TransportSetFn _transportSetFn = nullptr;
+    PairClearFn    _pairClearFn    = nullptr;
+    I2cScanFn      _i2cScanFn      = nullptr;
     bool _started = false;
 
     void _help();

@@ -10,6 +10,7 @@ void StatusLED::begin(uint8_t pin) {
 
 void StatusLED::setState(DeviceState s) {
     _state = s;
+    _lastTick = 0;  // force immediate paint — boot transitions must not be swallowed by tick rate-limit
     tick();
 }
 

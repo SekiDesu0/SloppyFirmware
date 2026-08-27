@@ -2,30 +2,29 @@
 #include <Arduino.h>
 #include <WiFiUdp.h>
 #include "PacketIO.h"
+#include "SensorTransport.h"
 
-class Discovery {
+class Discovery : public SensorTransport {
 public:
-    void begin(uint16_t port);
+    // SensorTransport
+    bool begin() override;                     // bind UDP_PORT
+    void sendHello(uint8_t hand) override;
+    uint32_t helloIntervalMs() const override { return cfg::HELLO_INTERVAL_MS; }
+    PacketType pump(WelcomePacket& welcomeOut, KeepalivePacket& keepaliveOut) override;
+    bool acceptWelcome(const WelcomePacket& w) override;
+    void clearServer() override;
+    bool hasServer() const override { return _hasServer; }
+    void sendData(const DataPacket& p) override;
+    String statusLine() const override;
+
+    // UDP specifics
     void stop();
-
-    // Broadcast HELLO beacon (call every HELLO_INTERVAL_MS in DISCOVERING).
-    void sendHello(uint8_t hand);
-
-    // Server has accepted device; remember its IP / keepalive interval.
+    void begin(uint16_t port);                 // legacy explicit-port form
     void setServer(const IPAddress& ip, uint16_t dataPort, uint32_t keepaliveMs);
-    void clearServer();
-
-    // Pump UDP rx. Call from loop() in DISCOVERING and STREAMING.
-    // Returns the received packet type (or 0 if nothing parsed).
-    PacketType pump(WelcomePacket& welcomeOut, KeepalivePacket& keepaliveOut);
-
-    // Send DATA packet to the server.
-    void sendData(const DataPacket& p);
 
     IPAddress serverIP() const { return _serverIP; }
     uint16_t  dataPort() const { return _dataPort; }
     uint32_t  keepaliveMs() const { return _keepaliveMs; }
-    bool      hasServer() const { return _hasServer; }
 
 private:
     WiFiUDP   _udp;

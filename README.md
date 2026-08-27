@@ -1,25 +1,158 @@
 # SloppyFirmware
 
-Reliable ESP32-S3 firmware for the SloppyHands glove. Reads all 12 MPR121
-electrodes (or a 4-channel FDC2214 capacitance sensor) and streams them over
-UDP to a discovery-based server, with serial-provisioned WiFi credentials
-stored in NVS.
+Reliable ESP32-S3 / ESP8266 firmware for the SloppyHands tracker. Reads all 12
+MPR121 electrodes (or a 4-channel FDC2214 capacitance sensor) and streams them
+to a server over **two selectable transports**:
+
+- **ESP-NOW** (default) — to a tiny ESP32-S3 USB HID dongle plugged into the PC
+- **WiFi UDP** — classic path straight to `test_tracker.py` on the local network
+
+with serial-provisioned WiFi credentials stored in NVS for the WiFi path.
+
+## Topology
+
+```
+[tracker L]──┐                          ┌─ USB HID input reports ─▶ test_tracker.py --source hid
+           ├── ESP-NOW ─▶ [S3 dongle]─┤
+[tracker R]──┘   auto-pair              └─ USB CDC serial console ─▶ CLI / status
+```
+
+Gloves hop Wi-Fi channels broadcasting HELLO beacons; the dongle listens on its
+fixed channel and answers WELCOME. The pairing (dongle MAC + channel) is stored
+in NVS so later boots reconnect instantly via unicast. More than two trackers
+works — the dongle keeps a peer table (`ESPNOW_MAX_PEERS`, default 8).
 
 ## Features
 
 - **Serial WiFi provisioning** — no hard-coded creds. Set via USB CDC serial:
   ```
-  wifi set <ssid> <pass>     # store & reboot
+  wifi set <ssid> <pass>     # store & reboot (WiFi transport only)
   wifi clear                 # erase & reboot
+  transport espnow|wifi      # pick ESP-NOW dongle or classic UDP (reboots)
+  pair clear                 # forget the paired dongle
   hand left|right|auto       # mark which hand this device is (v3, stored in NVS)
   sensor auto|mpr121|fdc2214 # select sensor (auto probes FDC2214 then MPR121)
   status                     # print diagnostics
   reset                      # soft reboot
   help
   ```
-  Credentials live in ESP32 NVS (Preferences namespace `wifi`) so they
-  survive reboots. If none are stored on first boot the device sits in a
-  blue-pulsing `PROVISIONING` state waiting for the `wifi set` command.
+  Credentials live in ESP32 NVS / ESP8266 EEPROM so they survive reboots. If
+  none are stored on first boot the device sits in a blue-pulsing
+  `PROVISIONING` state waiting for the `wifi set` command. The ESP-NOW path
+  needs no credentials at all.
+
+- **ESP-NOW transport + HID dongle** — `transport espnow` (the default) sends
+  the same wire packets over ESP-NOW instead of UDP. On the tracker side a
+  channel-hopping discovery finds the dongle, remembers its MAC/channel, then
+  streams DATA unicasts. See "Dongle firmware" below.
+
+## Building & flashing the tracker firmware
+
+Prerequisites: [PlatformIO](https://docs.platformio.org/en/latest/core/installation.html)
+(`pip install platformio` or the VS Code extension). No extra setup needed —
+library versions are resolved from `platformio.ini` on first build.
+
+Pick the environment matching your board:
+
+| Board | PlatformIO env | Notes |
+|-------|----------------|-------|
+| ESP32-S3 DevKitC-1 / SuperMini | `esp32-s3-devkitc-1` | built-in WS2812 on GPIO48 |
+| NodeMCU (ESP8266)              | `esp8266-nodemcuv2`  | needs external NeoPixel |
+| Wemos D1 Mini (ESP8266)        | `d1_mini`            | needs external NeoPixel |
+
+### Platform notes
+
+Both ESP32-S3 environments pin [pioarduino](https://github.com/pioarduino/platform-espressif32)
+— the community platform that ships arduino-esp32 3.x (IDF 5.x) — via its
+rolling `stable` release; official PlatformIO `espressif32` stopped at Arduino
+core 2.x. The ESP8266 environments use stock `espressif8266`. The dongle uses
+only the **core's** TinyUSB stack; do not add the external Adafruit TinyUSB
+library, or two copies of the USB stack collide (duplicate-symbol build
+crashes, most visibly on Windows).
+
+Compile and upload (plug the board in via USB; `PORT` is optional — PlatformIO
+auto-detects):
+
+```sh
+# NodeMCU
+pio run -e esp8266-nodemcuv2 -t upload            # add --upload-port COM5 (Windows) or /dev/ttyUSB0 (Linux)
+
+# Wemos D1 Mini
+pio run -e d1_mini -t upload
+
+# ESP32-S3 tracker
+pio run -e esp32-s3-devkitc-1 -t upload
+```
+
+Then open the serial console to provision (`Ctrl+T`, `Ctrl+T`, `Ctrl+H` style
+hotkeys are not needed — just type):
+
+```sh
+pio device monitor -e esp8266-nodemcuv2 -b 115200   # same for d1_mini / esp32-s3-devkitc-1
+```
+
+On first boot the LED pulses blue waiting for provisioning. For the WiFi/UDP
+transport run `wifi set <ssid> <pass>`; for the dongle path just leave the
+default (`transport espnow`) — no credentials needed.
+
+### ESP8266 wiring (NodeMCU / D1 Mini)
+
+| Signal   | NodeMCU label | D1 Mini label | GPIO     |
+|----------|---------------|---------------|----------|
+| I2C SDA  | D2            | D2            | GPIO4    |
+| I2C SCL  | D1            | D1            | GPIO5    |
+| NeoPixel | D6            | D6            | GPIO12   |
+
+The NeoPixel data line must be an **external** WS2812 chain on GPIO12 — the
+on-board LED of these boards is a plain GPIO LED, not addressable. Pins live in
+`include/config.h` if your wiring differs.
+
+## Dongle firmware (`env:esp32s3-dongle`)
+
+A separate firmware image for an ESP32-S3 board that plugs into the PC:
+
+- **Native USB composite** — the Arduino core's own TinyUSB stack (USBHID
+  classes), no external TinyUSB library. A vendor-defined **HID** interface
+  carries TUNNEL frames (DATA packet + source MAC + dongle RSSI) while a
+  **CDC serial interface** mirrors the log output, so a console on the
+  dongle's `ttyACM` port stays live while it streams. `ARDUINO_USB_CDC_ON_BOOT`
+  must stay `0`: setting it to 1 makes the core auto-start USB with default
+  descriptors before `setup()` and enumeration never happens.
+- **Serial console** on the same USB cable (the dongle's `ttyACM` port; open it
+  and the banner + prompt appear immediately):
+  ```
+  status        fw / channel / peer count / forwarded packets
+  list          known tracker peers with age, RSSI and last packet id
+  channel <n>   set ESP-NOW Wi-Fi channel (persisted in NVS, reboots)
+  forget        drop the in-RAM peer table; trackers re-pair on next HELLO
+  reset | help
+  ```
+- Log output (`[HB]` heartbeat every 5 s: `ch=` channel, `peers=`/`active=`
+  counts, `fwd=` forwarded packets) mirrors to the console **and UART0**
+  (TXD0/RXD0 pins — bench escape hatch only).
+- VID/PID: `0x303A`/`0x534C`.
+
+### Building & flashing
+
+```sh
+pio run -e esp32s3-dongle -t upload
+```
+
+A pre-upload hook (`tools/dongle_preupload.py`) puts the running app into the
+bootloader automatically — no manual reset needed (TinyUSB owns the PHY, so the
+usual hardware auto-reset path doesn't exist here).
+
+On the PC, run the tracker against the dongle:
+
+```
+pip install hidapi
+python test_tracker.py --source hid          # --vid/--pid to override matching
+```
+
+Tracker-side commands of interest: `transport espnow`, `pair clear`, `status`
+(shows link/dongle/RSSI). To move everything to another channel, flash the
+dongle with the new channel, then `pair clear` on each tracker so they re-hop
+from their default and re-pair.
 
 - **All 12 MPR121 electrodes streamed every frame.** The server (not the
   device) decides which electrode maps to which finger joint, so you can
@@ -34,6 +167,22 @@ stored in NVS.
   (`RCOUNT`, `SETTLECOUNT`, `DRIVE_CURRENT`/IDRIVE) lives in `include/config.h`;
   the internal reference oscillator is used, `SD` must be tied low, and `INTB`
   is left unconnected (data is polled over I2C).
+
+- **Optional battery gauge (v6)** — an ADC pin behind a resistor divider reads
+  the Li-ion cell every frame:
+  ```
+  VBAT --[R_TOP]--+--[R_BOT]-- GND
+                  |
+               ADC pin
+  ```
+  Pin, divider values and empty/full voltage are all set in
+  `include/config.h` (`BATT_ADC_PIN`, `BATT_DIVIDER_R_TOP/BOT`,
+  `BATT_EMPTY_VOLTS`, `BATT_FULL_VOLTS`). The tracker streams divider-compensated
+  millivolts plus a smoothed percent in every DATA frame (`255` percent =
+  disabled/unwired); the tracker shows it in the device table's **Batt**
+  column. ESP32-S3 default pin is GPIO4 — ADC1 only, since ADC2 can't be read
+  while the WiFi radio runs. ESP8266 uses A0 (onboard board divider assumed).
+  Set `BATT_ADC_PIN < 0` to build without it.
 
 - **SlimeVR-style reliability:**
   - Explicit state machine `PROVISIONING -> CONNECTING -> DISCOVERING -> STREAMING`
@@ -56,6 +205,11 @@ stored in NVS.
 | Solid red          | Connecting    | Attempting WiFi association              |
 | Yellow pulse       | Discovering   | WiFi up; broadcasting HELLO              |
 | Solid green        | Streaming     | Sending DATA frames to server            |
+| Purple SOS (morse) | Sensor absent | No MPR121/FDC2214 detected on the I2C bus |
+
+The sensor-absent pattern overrides all other states: the LED blinks `...`
+`---` `...` in purple until a sensor is found (re-probed on reboot, or switch
+the active sensor with `sensor auto|mpr121|fdc2214`).
 
 ## Wiring
 
@@ -66,6 +220,7 @@ stored in NVS.
 | WS2812   | GPIO 48      |
 | MPR121   | I2C 0x5A     |
 | FDC2214  | I2C 0x2A/0x2B |
+| Battery ADC (divider tap) | GPIO 4 |
 
 I2C runs at 400 kHz. (Adjust in `include/config.h`.)
 
@@ -76,8 +231,8 @@ All packets share an 8-byte header for identification:
 | Field     | C type   | Size | Notes                                  |
 |-----------|----------|------|----------------------------------------|
 | magic     | uint32   | 4    | `0x534C5031` ("SLP1")                  |
-| type      | uint8    | 1    | 1=HELLO 2=WELCOME 3=DATA 4=KEEPALIVE 5=BYE |
-| fwVersion | uint8    | 1    | firmware version (currently `4`)       |
+| type      | uint8    | 1    | 1=HELLO 2=WELCOME 3=DATA 4=KEEPALIVE 5=BYE 6=TUNNEL |
+| fwVersion | uint8    | 1    | firmware version (currently `6`)       |
 | reserved  | uint16   | 2    | 0                                      |
 
 All multi-byte fields are little-endian; all structs are `__attribute__((packed))`.
@@ -99,7 +254,7 @@ uint16_t dataPort;         // 2  UDP port the server wants DATA sent to
 uint16_t keepaliveMs;      // 2  cadence at which server will send KEEPALIVE
 ```
 
-### DATA (device -> server, ~50 FPS) — 66 bytes
+### DATA (device -> server, ~50 FPS) — 69 bytes
 ```c
 struct Header;             // 8
 uint32_t packetId;         // 4
@@ -113,6 +268,8 @@ uint16_t i2cReadTimeMs;    // 2
 uint16_t totalLoopTimeMs;  // 2
 int8_t   wifiRssi;         // 1
 uint8_t  reserved3;        // 1
+uint16_t battMv;           // 2   battery cell mV (divider-compensated; 0 = unknown) -- v6
+uint8_t  battPercent;      // 1   0..100 (255 = unknown/disabled) -- v6
 ```
 
 `sensorType` selects which payload is live: `0` = none, `1` = MPR121
@@ -132,11 +289,28 @@ uint32_t lastSeenPacketId; // 4
 ### BYE (either side) — 12 bytes (same shape as KEEPALIVE)
 Optional graceful-shutdown packet.
 
+### TUNNEL (dongle -> PC, one USB HID report) — 85 bytes
+```c
+struct Header;             // 8   type = 6
+uint8_t  mac[6];           // 6   source tracker MAC
+int8_t   rssi;             // 1   ESP-NOW rx RSSI measured by the dongle
+uint8_t  reserved;         // 1
+DataPacket data;           // 69  embedded DATA frame
+```
+The dongle wraps every tracker DATA frame so the PC-side tracker can identify
+which tracker it came from (over UDP the sender IP plays that role). The same
+packets ride over both transports unchanged; only TUNNEL is HID-specific.
+Because a full-speed HID endpoint caps at 64 bytes per transaction, each
+TUNNEL frame travels as two input reports: ID 1 = first 62 bytes,
+ID 2 = remaining 23.
+
 ## Server
 
 `test_tracker.py` is the reference server/tracker. It:
 
-1. Binds UDP 4242.
+1. Binds UDP 4242 (`--source udp`) **or** reads TUNNEL reports from
+   the dongle's HID interface (`--source hid`). The source is also a pair of
+   radio buttons in the GUI and can be switched while running (see 12).
 2. Listens for `HELLO` broadcasts from multiple devices simultaneously.
 3. Replies with a unicast `WELCOME` (`dataPort=4242`, `keepaliveMs=1000`) per device.
 4. Parses incoming `DATA` packets (12 MPR121 electrodes + touch bitmask, or 4 FDC2214 raw channels, + RSSI + timing).
@@ -156,18 +330,35 @@ Optional graceful-shutdown packet.
    captures a resting `baseline` and a flexed value per channel, then the
    tracker normalizes `flex = clamp((baseline − raw) / delta, 0..1)`, driving
    the bars and skeleton fingers.
-9. **Smoothing** — per-joint pipeline: median filter -> EMA -> deadband.
+9. **MPR121 calibration** — an `MPR Calibrate` tab does the same per-channel
+   rest/flex capture across all 12 electrodes (`mpr_cal` in
+   `tracker_config.json`). Channels with a captured delta normalize through
+   it; uncalibrated channels keep falling back to the global Baseline /
+   Max Delta sliders. Both calibrate tabs have a `Reset Cal` button per hand
+   that zeroes that hand's captured table again.
+10. **Smoothing** — per-joint pipeline: median filter -> EMA -> deadband.
    Global sliders in the Settings tab.
    - `Snake`/EMA alpha — 0.01 (smooth) .. 1.0 (raw)
    - median window — odd 1..9 (spike rejection)
    - deadband — ignore tiny jitter (0 .. 0.2)
-10. Drops devices that go silent for >5 s back to Pending so they re-handshake
+11. Drops devices that go silent for >5 s back to Pending so they re-handshake
     on the next `HELLO`.
+12. **Runtime source switching + dongle hotplug** — radio buttons above the
+    device list pick `WiFi UDP` vs `ESP-NOW dongle` while the tracker is
+    running; the choice persists in `tracker_config.json` (`--source` remains
+    a boot override). In dongle mode an unplugged USB dongle turns the status
+    line red (`[DONGLE OFFLINE]`) and skeletons drop out via the normal 5 s
+    timeout; plugging it     back in reconnects automatically and trackers resume
+    their saved hand slots. Starting in HID mode with no dongle attached also
+    works: the tracker waits for it instead of exiting.
+13. **Battery column** — fw>=6 trackers report cell millivolts + percent in every
+    frame; the device table's `Batt` column (and the diagnostics line) show the
+    live percentage. Older firmware or disabled monitors display `-`.
 
 Run it:
 
 ```
-python test_tracker.py
+python test_tracker.py [--source udp|hid]
 ```
 
 Requires SteamVR only if you want right-hand thumb/index fusion; falls back

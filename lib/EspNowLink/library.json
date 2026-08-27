@@ -1,0 +1,7 @@
+{
+    "name": "EspNowLink",
+    "version": "1.0.0",
+    "description": "Cross-platform (ESP8266/ESP32) ESP-NOW link layer with rx ring buffer and peer bookkeeping",
+    "frameworks": ["arduino"],
+    "platforms": ["espressif8266", "espressif32"]
+}

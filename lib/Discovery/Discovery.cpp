@@ -14,6 +14,11 @@ void Discovery::begin(uint16_t port) {
     _udpStarted = true;
 }
 
+bool Discovery::begin() {
+    begin(cfg::UDP_PORT);
+    return _udpStarted;
+}
+
 void Discovery::stop() {
     if (_udpStarted) {
         _udp.stop();
@@ -42,6 +47,13 @@ void Discovery::setServer(const IPAddress& ip, uint16_t dataPort, uint32_t keepa
     _dataPort    = dataPort ? dataPort : _localPort;
     _keepaliveMs = keepaliveMs ? keepaliveMs : 1000;
     _hasServer   = true;
+}
+
+bool Discovery::acceptWelcome(const WelcomePacket& w) {
+    // pump() captured the sender IP in _serverIP; adopt it with the offered
+    // data port / keepalive cadence.
+    setServer(_serverIP, w.dataPort, w.keepaliveMs);
+    return _hasServer;
 }
 
 void Discovery::clearServer() {
@@ -90,4 +102,14 @@ void Discovery::sendData(const DataPacket& p) {
     _udp.beginPacket(_serverIP, _dataPort);
     _udp.write((uint8_t*)&p, sizeof(p));
     _udp.endPacket();
+}
+
+String Discovery::statusLine() const {
+    if (!_hasServer) {
+        return String("link=wifi-udp server=none");
+    }
+    char buf[96];
+    snprintf(buf, sizeof(buf), "link=wifi-udp server=%s:%u keepaliveMs=%lu",
+             _serverIP.toString().c_str(), _dataPort, (unsigned long)_keepaliveMs);
+    return String(buf);
 }
