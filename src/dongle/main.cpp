@@ -363,7 +363,7 @@ static void cliExec(const String& line) {
     if (t == "forget") {
         peerCount = 0;
         memset(peers, 0, sizeof(peers));
-        cliPrintln("Peer table dropped. Gloves will re-pair.");
+        cliPrintln("Peer table dropped. Trackers will re-pair.");
         return;
     }
 

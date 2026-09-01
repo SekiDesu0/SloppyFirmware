@@ -61,8 +61,7 @@ struct __attribute__((packed)) DataPacket {
     uint16_t totalLoopTimeMs;
     int8_t   wifiRssi;
     uint8_t  reserved3;
-    // v6 (FW_VERSION >= 6) battery fields. Appended so v4/v3 parsers can
-    // still read the prefix of newer frames by length.
+    // Battery fields (FW_VERSION >= 6).
     uint16_t battMv;           // divider-compensated cell mV; 0 = unknown
     uint8_t  battPercent;      // 0..100; 255 = unknown/disabled
 };                             // 69 bytes

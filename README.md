@@ -9,15 +9,23 @@ to a server over **two selectable transports**:
 
 with serial-provisioned WiFi credentials stored in NVS for the WiFi path.
 
+> **What is a SloppyHands?** It is a **hand tracker** — a small sensor board
+> you attach to your VR controller so the flex of your fingers can drive finger
+> tracking. It is **not a glove**: nothing is worn over the hand, and the device
+> itself does not move your fingers. The tracker measures finger flex; the
+> server maps that flex to joints and (optionally) feeds SteamVR/other
+> pipelines. Throughout this document "tracker" and "device" are the same
+> thing.
+
 ## Topology
 
 ```
 [tracker L]──┐                          ┌─ USB HID input reports ─▶ test_tracker.py --source hid
-           ├── ESP-NOW ─▶ [S3 dongle]─┤
+            ├── ESP-NOW ─▶ [S3 dongle]─┤
 [tracker R]──┘   auto-pair              └─ USB CDC serial console ─▶ CLI / status
 ```
 
-Gloves hop Wi-Fi channels broadcasting HELLO beacons; the dongle listens on its
+Trackers hop Wi-Fi channels broadcasting HELLO beacons; the dongle listens on its
 fixed channel and answers WELCOME. The pairing (dongle MAC + channel) is stored
 in NVS so later boots reconnect instantly via unicast. More than two trackers
 works — the dongle keeps a peer table (`ESPNOW_MAX_PEERS`, default 8).
@@ -30,7 +38,7 @@ works — the dongle keeps a peer table (`ESPNOW_MAX_PEERS`, default 8).
   wifi clear                 # erase & reboot
   transport espnow|wifi      # pick ESP-NOW dongle or classic UDP (reboots)
   pair clear                 # forget the paired dongle
-  hand left|right|auto       # mark which hand this device is (v3, stored in NVS)
+  hand left|right|auto       # mark which hand this device is (stored in NVS)
   sensor auto|mpr121|fdc2214 # select sensor (auto probes FDC2214 then MPR121)
   status                     # print diagnostics
   reset                      # soft reboot
@@ -168,7 +176,7 @@ from their default and re-pair.
   the internal reference oscillator is used, `SD` must be tied low, and `INTB`
   is left unconnected (data is polled over I2C).
 
-- **Optional battery gauge (v6)** — an ADC pin behind a resistor divider reads
+- **Optional battery gauge** — an ADC pin behind a resistor divider reads
   the Li-ion cell every frame:
   ```
   VBAT --[R_TOP]--+--[R_BOT]-- GND
@@ -226,7 +234,21 @@ I2C runs at 400 kHz. (Adjust in `include/config.h`.)
 
 ## Wire protocol
 
-All packets share an 8-byte header for identification:
+This is the complete, versioned wire format. It is stable enough to implement
+from scratch in any language; `lib/PacketIO/PacketIO.h` (firmware) and the
+constants at the top of `test_tracker.py` (Python) are the two reference
+implementations.
+
+### Conventions
+
+- **Endianness:** all multi-byte fields are **little-endian**.
+- **Packing:** every struct is `__attribute__((packed))` (C) / `<` format
+  string (Python `struct`) — no padding between fields.
+- **Magic:** every packet starts with `0x534C5031` ("SLP1").
+- **`fwVersion`:** currently `6`. Always check the magic and type before
+  trusting the rest of a packet.
+
+### Common header — 8 bytes
 
 | Field     | C type   | Size | Notes                                  |
 |-----------|----------|------|----------------------------------------|
@@ -235,26 +257,48 @@ All packets share an 8-byte header for identification:
 | fwVersion | uint8    | 1    | firmware version (currently `6`)       |
 | reserved  | uint16   | 2    | 0                                      |
 
-All multi-byte fields are little-endian; all structs are `__attribute__((packed))`.
+### Python `struct` reference
 
-### HELLO (device -> broadcast, every 1 s while DISCOVERING) — 18 bytes
+Copy these verbatim; they mirror `test_tracker.py`:
+
+```python
+import struct
+MAGIC = 0x534C5031  # "SLP1"
+
+HEADER_FMT   = "<IBBH"                    # magic, type, fwVersion, reserved
+HELLO_FMT    = "<IBBH6sBBBB"              # + mac(6s) deviceType channelCount hand reserved
+WELCOME_FMT  = "<IBBHH"                   # + dataPort keepaliveMs
+DATA_FMT     = "<IBBII12HH4IBBHHbBHB"     # full 69-byte sensor frame (below)
+KEEP_FMT     = "<IBBI"                    # + lastSeenPacketId
+TUNNEL_FMT   = "<IBBH6sbB"                # + mac(6s) rssi reserved, then an embedded DATA
+
+HELLO_LEN    = struct.calcsize(HELLO_FMT)    # 18
+WELCOME_LEN  = struct.calcsize(WELCOME_FMT)  # 12
+DATA_LEN     = struct.calcsize(DATA_FMT)     # 69
+KEEP_LEN     = struct.calcsize(KEEP_FMT)     # 12
+TUNNEL_LEN   = struct.calcsize(TUNNEL_FMT) + DATA_LEN   # 16 + 69 = 85
+```
+
+### Packet types
+
+#### HELLO (tracker -> broadcast, every 1 s while DISCOVERING) — 18 bytes
 ```c
 struct Header;             // 8
 uint8_t  mac[6];           // 6
 uint8_t  deviceType;       // 1  (SloppyHands = 1)
 uint8_t  channelCount;     // 1  (12; informational — DATA.sensorType is authoritative)
-uint8_t  hand;             // 1  (0=unknown, 1=left, 2=right)  -- v3
+uint8_t  hand;             // 1  (0=unknown, 1=left, 2=right)
 uint8_t  reserved;         // 1
 ```
 
-### WELCOME (server -> device, unicast) — 12 bytes
+#### WELCOME (server -> tracker, unicast) — 12 bytes
 ```c
 struct Header;             // 8
-uint16_t dataPort;         // 2  UDP port the server wants DATA sent to
+uint16_t dataPort;         // 2  UDP port the server wants DATA sent to (unused over ESP-NOW)
 uint16_t keepaliveMs;      // 2  cadence at which server will send KEEPALIVE
 ```
 
-### DATA (device -> server, ~50 FPS) — 69 bytes
+#### DATA (tracker -> server, ~50 FPS) — 69 bytes
 ```c
 struct Header;             // 8
 uint32_t packetId;         // 4
@@ -268,9 +312,14 @@ uint16_t i2cReadTimeMs;    // 2
 uint16_t totalLoopTimeMs;  // 2
 int8_t   wifiRssi;         // 1
 uint8_t  reserved3;        // 1
-uint16_t battMv;           // 2   battery cell mV (divider-compensated; 0 = unknown) -- v6
-uint8_t  battPercent;      // 1   0..100 (255 = unknown/disabled) -- v6
+uint16_t battMv;           // 2   battery cell mV (divider-compensated; 0 = unknown)
+uint8_t  battPercent;      // 1   0..100 (255 = unknown/disabled)
 ```
+
+`field` order note for Python unpacking: after the header the tuple is
+`(packetId, uptimeMs, filtered[12], touchStatus, fdcRaw[4], sensorType,
+reserved2, i2cReadTimeMs, totalLoopTimeMs, wifiRssi, reserved3, battMv,
+battPercent)`.
 
 `sensorType` selects which payload is live: `0` = none, `1` = MPR121
 (`filtered` + `touchStatus`), `2` = FDC2214 (`fdcRaw`). The inactive payload is
@@ -280,16 +329,16 @@ zero-filled.
 (≈14 M corresponds to a ~2.1 MHz sensor oscillation). It *decreases* as
 capacitance rises, so the server computes flex as `baseline − raw`.
 
-### KEEPALIVE (server -> device) — 12 bytes
+#### KEEPALIVE (server -> tracker) — 12 bytes
 ```c
 struct Header;             // 8
 uint32_t lastSeenPacketId; // 4
 ```
 
-### BYE (either side) — 12 bytes (same shape as KEEPALIVE)
+#### BYE (either side) — 12 bytes (same shape as KEEPALIVE)
 Optional graceful-shutdown packet.
 
-### TUNNEL (dongle -> PC, one USB HID report) — 85 bytes
+#### TUNNEL (dongle -> PC, one USB HID report) — 85 bytes
 ```c
 struct Header;             // 8   type = 6
 uint8_t  mac[6];           // 6   source tracker MAC
@@ -301,19 +350,107 @@ The dongle wraps every tracker DATA frame so the PC-side tracker can identify
 which tracker it came from (over UDP the sender IP plays that role). The same
 packets ride over both transports unchanged; only TUNNEL is HID-specific.
 Because a full-speed HID endpoint caps at 64 bytes per transaction, each
-TUNNEL frame travels as two input reports: ID 1 = first 62 bytes,
-ID 2 = remaining 23.
+TUNNEL frame travels as two input reports: **ID 1 = first 62 bytes,
+ID 2 = remaining 23.**
+
+> **HID reassembly caveat (Windows):** a full-speed HID class driver pads every
+> report to the largest report size (62 bytes), so report ID 2 arrives as **63
+> bytes** on Windows (23 payload bytes + 40 padding), while hidraw on Linux
+> returns it at its exact 23-byte size. Always slice report ID 2 to
+> `TUNNEL_LEN - 62 = 23` bytes, and only reassemble when you have a full 62-byte
+> part 1 buffered (see `test_tracker.py` `ingest_hid_reports`).
+
+### Handshake / session sequence
+
+1. **Discovery** — tracker broadcasts `HELLO` (every 1 s over UDP; every 300 ms
+   while channel-hopping over ESP-NOW) until it hears a `WELCOME`.
+2. **Accept** — the server/dongle replies `WELCOME` unicast with `keepaliveMs`
+   (and `dataPort` for UDP). The tracker latches the sender (IP or dongle MAC)
+   and enters STREAMING.
+3. **Stream** — tracker sends `DATA` at ~50 FPS.
+4. **Keepalive** — server/dongle sends `KEEPALIVE` every `keepaliveMs`
+   (default 1000 ms), echoing `lastSeenPacketId`. The tracker resets its
+   5 s watchdog on each one.
+5. **Timeout** — if no `KEEPALIVE` arrives for 5 s, the tracker drops the
+   session and returns to DISCOVERY (or CONNECTING on WiFi loss).
+6. **Shutdown (optional)** — either side may send `BYE` to end a session.
+
+## Calibration
+
+Flex is derived from **capacitance**: both sensors report a value that
+*decreases* as capacitance rises (a finger bending toward the electrode adds
+capacitance). So the flex amount is always a **difference from a resting
+baseline**:
+
+```
+flex = clamp((baseline - raw) / delta, 0..1)
+```
+
+- **FDC2214** `raw` is the 28-bit conversion result = `fSENSOR / fREF × 2^28`
+  (≈14 M at rest ≈2.1 MHz); it drops as a finger approaches.
+- **MPR121** `filtered` is the 16-bit filtered electrode value; it also drops
+  on touch/flex.
+
+### Per-channel calibration tables
+
+Each hand stores its own `{baseline, flexed, delta}` table, one entry per
+channel (4 for FDC2214, 12 for MPR121). They are persisted per hand in
+`tracker_config.json` under `hands.left.fdc_cal`, `hands.left.mpr_cal`,
+`hands.right.fdc_cal`, `hands.right.mpr_cal`:
+
+```json
+"fdc_cal": { "baseline": [0, 0, 0, 0], "flexed": [0, 0, 0, 0], "delta": [0, 0, 0, 0] },
+"mpr_cal": { "baseline": [0, ...12],  "flexed": [0, ...12],  "delta": [0, ...12] }
+```
+
+### Capture flow (per hand, per sensor)
+
+1. **Set Rest** — with the hand open, the tracker averages that hand's live
+   channels for 0.6 s and stores the result as `baseline`.
+2. **Set Flex** — make a fist; the tracker averages for 0.6 s into `flexed`,
+   then computes per channel:
+   ```
+   delta = max(0, baseline - flexed)
+   ```
+3. **Normalize** — at runtime each joint maps to a channel and applies
+   `flex = clamp((baseline[ch] - raw[ch]) / delta[ch], 0..1)`.
+
+A channel with `delta <= 0` is **uncalibrated**:
+
+- **MPR121** falls back to the global **Baseline** / **Max Delta** sliders:
+  ```
+  norm = clamp((baseline - raw) / max_delta, 0..1)
+  ```
+- **FDC2214** reports `0` flex (no global fallback).
+
+The GUI has a `FDC Calibrate` and an `MPR Calibrate` tab with per-hand
+`Set Rest` / `Set Flex` / `Reset Cal` buttons; `Reset Cal` zeroes that hand's
+table again.
+
+### Smoothing
+
+After normalization each joint runs through the same pipeline
+(`Smoother.update` in `test_tracker.py`):
+
+1. **Median filter** over a window of `median_window` (odd, 1..9) samples —
+   rejects single-sample spikes.
+2. **EMA** — `smoothed = alpha * median + (1 - alpha) * smoothed`, with
+   `ema_alpha` from 0.01 (very smooth) to 1.0 (raw).
+3. **Deadband** — if `|smoothed - last_output| < deadband` (0..0.2), hold the
+   previous output to ignore tiny jitter.
 
 ## Server
 
-`test_tracker.py` is the reference server/tracker. It:
+`test_tracker.py` is the reference server/tracker — a dev tool for exercising
+the ESP firmware (receive its frames over UDP or the HID dongle, visualize the
+hands, and calibrate the sensors). It is **not** a production consumer. It:
 
 1. Binds UDP 4242 (`--source udp`) **or** reads TUNNEL reports from
    the dongle's HID interface (`--source hid`). The source is also a pair of
-   radio buttons in the GUI and can be switched while running (see 12).
+   radio buttons in the GUI and can be switched while running.
 2. Listens for `HELLO` broadcasts from multiple devices simultaneously.
 3. Replies with a unicast `WELCOME` (`dataPort=4242`, `keepaliveMs=1000`) per device.
-4. Parses incoming `DATA` packets (12 MPR121 electrodes + touch bitmask, or 4 FDC2214 raw channels, + RSSI + timing).
+4. Parses incoming `DATA` packets (12 MPR121 electrodes + touch bitmask, or 4 FDC2214 raw channels, + RSSI + timing + battery).
 5. Sends `KEEPALIVE` once per second to each alive device.
 6. **Two hand slots (Left + Right)** — each discovered device shows up in the
    device list with a `hand` dropdown (`auto`/`left`/`right`). Assigning to
@@ -321,9 +458,10 @@ ID 2 = remaining 23.
    persisted by MAC in `tracker_config.json` so devices keep their slot
    across reboots.
 7. **Per-hand electrode -> joint mapping** — the Settings/Map tabs expose
-   dropdowns for every joint. The Right hand defaults to SteamVR thumb+index
-   (overridable by assigning an electrode to those joints). The Left hand
-   has no SteamVR fusion, so all 10 joints must come from electrodes.
+   dropdowns for every joint. Both hands fuse SteamVR thumb+index from the
+   attached VR controller (overridable per joint by assigning an electrode to
+   it); the middle finger also falls back to the controller grip when its
+   electrodes are unmapped and read zero. See "SteamVR fusion" below.
 8. **FDC2214 mapping + calibration** — the map tabs expose a second `FDC`
    column so each joint maps to channel `0..3` (same channel on proximal+distal
    = one electrode per finger; different channels = two). A `FDC Calibrate` tab
@@ -337,10 +475,10 @@ ID 2 = remaining 23.
    Max Delta sliders. Both calibrate tabs have a `Reset Cal` button per hand
    that zeroes that hand's captured table again.
 10. **Smoothing** — per-joint pipeline: median filter -> EMA -> deadband.
-   Global sliders in the Settings tab.
-   - `Snake`/EMA alpha — 0.01 (smooth) .. 1.0 (raw)
-   - median window — odd 1..9 (spike rejection)
-   - deadband — ignore tiny jitter (0 .. 0.2)
+    Global sliders in the Settings tab.
+    - EMA alpha — 0.01 (smooth) .. 1.0 (raw)
+    - median window — odd 1..9 (spike rejection)
+    - deadband — ignore tiny jitter (0 .. 0.2)
 11. Drops devices that go silent for >5 s back to Pending so they re-handshake
     on the next `HELLO`.
 12. **Runtime source switching + dongle hotplug** — radio buttons above the
@@ -348,12 +486,32 @@ ID 2 = remaining 23.
     running; the choice persists in `tracker_config.json` (`--source` remains
     a boot override). In dongle mode an unplugged USB dongle turns the status
     line red (`[DONGLE OFFLINE]`) and skeletons drop out via the normal 5 s
-    timeout; plugging it     back in reconnects automatically and trackers resume
+    timeout; plugging it back in reconnects automatically and trackers resume
     their saved hand slots. Starting in HID mode with no dongle attached also
     works: the tracker waits for it instead of exiting.
-13. **Battery column** — fw>=6 trackers report cell millivolts + percent in every
+13. **Battery column** — trackers report cell millivolts + percent in every
     frame; the device table's `Batt` column (and the diagnostics line) show the
-    live percentage. Older firmware or disabled monitors display `-`.
+    live percentage. A disabled/unwired monitor displays `-`.
+
+### SteamVR fusion
+
+When SteamVR is running, `test_tracker.py` fuses the attached VR controller's
+thumb + index input with the tracker's electrode data, for **both hands**. The
+middle finger falls back to the controller grip; ring/pinky are always
+electrode-driven.
+
+| Joint  | Controller input                                                          |
+|--------|---------------------------------------------------------------------------|
+| Index  | trigger axis (touch = 0.2, pull = axis value)                             |
+| Thumb  | A (right) / X (left), B (right) / Y (left), or the thumbstick (stick X = thumb angle, stick Y = curl) |
+| Middle | grip button (fallback only — when both mid joints are unmapped and read zero) |
+
+- **Electrode override** — mapping an electrode to `thumb_p/d` or `index_p/d`
+  makes that joint electrode-driven, overriding the SteamVR input for it.
+- Thumb/index are **unmapped by default**, so fusion is on out of the box; the
+  left hand's thumb pose and curl are mirrored to match its geometry.
+- Requires SteamVR running (`VRApplication_Scene`); without it the tracker
+  degrades gracefully to electrode-only tracking for every joint.
 
 Run it:
 
@@ -361,5 +519,5 @@ Run it:
 python test_tracker.py [--source udp|hid]
 ```
 
-Requires SteamVR only if you want right-hand thumb/index fusion; falls back
-gracefully. The left hand is always fully ESP32-driven.
+Requires SteamVR only if you want thumb/index fusion (both hands); falls back
+gracefully to electrode-only tracking when SteamVR isn't running.

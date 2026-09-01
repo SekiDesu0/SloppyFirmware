@@ -38,7 +38,7 @@ except Exception:
 
 
 # ---------------------------------------------------------------------------
-# Protocol (mirrors firmware lib/PacketIO)  - v3: HELLO now carries `hand`
+# Protocol (mirrors firmware lib/PacketIO)
 # ---------------------------------------------------------------------------
 MAGIC      = 0x534C5031  # "SLP1"
 PORT       = 4242
@@ -69,14 +69,9 @@ HEADER_FMT = "<IBBH"
 HELLO_FMT = HEADER_FMT + "6sBBBB"
 # Welcome: header + dataPort(H) + keepaliveMs(H) = 12
 WELCOME_FMT = HEADER_FMT + "HH"
-# Data (v3, fw<4): header + packetId(I) uptime(I) filtered(12H) touch(H) i2c(H) loop(H) rssi(b) reserved(B) = 48
-DATA_FMT_V3 = HEADER_FMT + "II12HHHHbB"
-DATA_LEN_V3 = struct.calcsize(DATA_FMT_V3)
-# Data (v4, fw 4..5): header + packetId(I) uptime(I) filtered(12H) touch(H) fdcRaw(4I)
-#                    sensorType(B) reserved2(B) i2c(H) loop(H) rssi(b) reserved3(B) = 66
-DATA_FMT_V4 = HEADER_FMT + "II12HH4IBBHHbB"
-DATA_LEN_V4 = struct.calcsize(DATA_FMT_V4)
-# Data (v6, fw>=6): v4 + battery: divider-compensated cell mV (H) + percent (B) = 69
+# Data: header + packetId(I) uptime(I) filtered(12H) touch(H) fdcRaw(4I)
+#       sensorType(B) reserved2(B) i2c(H) loop(H) rssi(b) reserved3(B)
+#       + battery: divider-compensated cell mV (H) + percent (B) = 69
 DATA_FMT = HEADER_FMT + "II12HH4IBBHHbBHB"
 DATA_LEN = struct.calcsize(DATA_FMT)
 # Keepalive: header + lastSeenPacketId(I) = 12
@@ -135,17 +130,29 @@ JOINT_KEYS = [
     ("ring_d",  "Ring Dist"),
     ("pinky_p", "Pinky Prox"),
     ("pinky_d", "Pinky Dist"),
-    # Left hand has no SteamVR fusion, so we also map thumb + index from electrodes:
+    # thumb/index unmapped by default so both hands fall back to SteamVR fusion:
     ("thumb_p", "Thumb Prox"),
     ("thumb_d", "Thumb Dist"),
     ("index_p", "Index Prox"),
     ("index_d", "Index Dist"),
 ]
-DEFAULT_MAP_RIGHT = {k: i for i, (k, _) in enumerate(JOINT_KEYS[:6])}  # mid/ring/pinky only
-DEFAULT_MAP_LEFT  = {k: (i if i < 12 else None) for i, (k, _) in enumerate(JOINT_KEYS)}
+DEFAULT_MAP_RIGHT = {
+    "mid_p": 0, "mid_d": 1,
+    "ring_p": 2, "ring_d": 3,
+    "pinky_p": 4, "pinky_d": 5,
+    "thumb_p": None, "thumb_d": None,
+    "index_p": None, "index_d": None,
+}
+DEFAULT_MAP_LEFT = {
+    "mid_p": 0, "mid_d": 1,
+    "ring_p": 2, "ring_d": 3,
+    "pinky_p": 4, "pinky_d": 5,
+    "thumb_p": None, "thumb_d": None,
+    "index_p": None, "index_d": None,
+}
 
 # FDC2214: 4 channels, default 1 electrode per finger (prox+dist share a channel)
-# for middle/ring/pinky. thumb/index unmapped (right hand falls back to SteamVR).
+# for middle/ring/pinky. thumb/index unmapped (both hands fall back to SteamVR).
 DEFAULT_FDC_MAP = {
     "mid_p": 0, "mid_d": 0,
     "ring_p": 1, "ring_d": 1,
@@ -546,62 +553,77 @@ cfg = load_config()
 
 
 # ---------------------------------------------------------------------------
-# SteamVR fusion (right controller only)
+# SteamVR fusion (thumb + index, both hands)
 # ---------------------------------------------------------------------------
 vr_sys = None
 vr_enabled = False
 
 try:
-    vr_sys = openvr.init(openvr.VRApplication_Background)
+    vr_sys = openvr.init(openvr.VRApplication_Scene)
     vr_enabled = True
-    print("SteamVR hooked. Right-controller thumb + index fusion active.")
+    print("SteamVR hooked. Thumb + index fusion active (both hands).")
 except Exception as e:
     print(f"[WARNING] SteamVR not running. Thumb/Index fusion disabled. ({e})")
 
+# Neutral "no controller" tuple: (index_flex, (thumb_btn, thumb_flex, stick_x, stick_y), grip_flex)
+NEUTRAL_VR = (0.0, ("None", 0.0, 0.0, 0.0), 0.0)
 
-def get_vr_flex():
+
+def _read_vr_controller(role):
+    """Read the tracked controller with the given SteamVR role, returning the
+    same (index_flex, thumb, grip_flex) tuple, or NEUTRAL_VR if absent."""
     if not vr_enabled or vr_sys is None:
-        return 0.0, ("None", 0.0, 0.0, 0.0), 0.0
-    right_id = None
+        return NEUTRAL_VR
+    dev = None
     for i in range(openvr.k_unMaxTrackedDeviceCount):
         if vr_sys.getTrackedDeviceClass(i) == openvr.TrackedDeviceClass_Controller:
-            if vr_sys.getControllerRoleForTrackedDeviceIndex(i) == openvr.TrackedControllerRole_RightHand:
-                right_id = i
+            if vr_sys.getControllerRoleForTrackedDeviceIndex(i) == role:
+                dev = i
                 break
-    if right_id is not None:
-        result, state = vr_sys.getControllerState(right_id)
-        if result:
-            trig_val = state.rAxis[1].x
-            trig_touched = bool(state.ulButtonTouched & (1 << openvr.k_EButton_Axis1))
-            index_flex = trig_val if trig_val > 0.05 else (0.2 if trig_touched else 0.0)
-            thumb_btn = "None"
-            thumb_flex = 0.0
-            stick_x = state.rAxis[0].x
-            stick_y = state.rAxis[0].y
-            if bool(state.ulButtonPressed & (1 << openvr.k_EButton_A)):
-                thumb_btn, thumb_flex = "A", 1.0
-            elif bool(state.ulButtonTouched & (1 << openvr.k_EButton_A)):
-                thumb_btn, thumb_flex = "A", 0.5
-            elif bool(state.ulButtonPressed & (1 << openvr.k_EButton_ApplicationMenu)):
-                thumb_btn, thumb_flex = "B", 1.0
-            elif bool(state.ulButtonTouched & (1 << openvr.k_EButton_ApplicationMenu)):
-                thumb_btn, thumb_flex = "B", 0.5
-            elif bool(state.ulButtonPressed & (1 << openvr.k_EButton_SteamVR_Touchpad)):
-                thumb_btn, thumb_flex = "Stick", 1.0
-            elif bool(state.ulButtonTouched & (1 << openvr.k_EButton_SteamVR_Touchpad)):
-                thumb_btn, thumb_flex = "Stick", 0.5
-            grip_pressed = bool(state.ulButtonPressed & (1 << openvr.k_EButton_Grip))
-            grip_touched = bool(state.ulButtonTouched & (1 << openvr.k_EButton_Grip))
-            grip_flex = 1.0 if grip_pressed else (0.5 if grip_touched else 0.0)
-            return index_flex, (thumb_btn, thumb_flex, stick_x, stick_y), grip_flex
-    return 0.0, ("None", 0.0, 0.0, 0.0), 0.0
+    if dev is None:
+        return NEUTRAL_VR
+    result, state = vr_sys.getControllerState(dev)
+    if not result:
+        return NEUTRAL_VR
+
+    trig_val = state.rAxis[1].x
+    trig_touched = bool(state.ulButtonTouched & (1 << openvr.k_EButton_Axis1))
+    index_flex = trig_val if trig_val > 0.05 else (0.2 if trig_touched else 0.0)
+
+    thumb_btn = "None"
+    thumb_flex = 0.0
+    stick_x = state.rAxis[0].x
+    stick_y = state.rAxis[0].y
+    if bool(state.ulButtonPressed & (1 << openvr.k_EButton_A)):
+        thumb_btn, thumb_flex = "A", 1.0
+    elif bool(state.ulButtonTouched & (1 << openvr.k_EButton_A)):
+        thumb_btn, thumb_flex = "A", 0.5
+    elif bool(state.ulButtonPressed & (1 << openvr.k_EButton_ApplicationMenu)):
+        thumb_btn, thumb_flex = "B", 1.0
+    elif bool(state.ulButtonTouched & (1 << openvr.k_EButton_ApplicationMenu)):
+        thumb_btn, thumb_flex = "B", 0.5
+    elif bool(state.ulButtonPressed & (1 << openvr.k_EButton_SteamVR_Touchpad)):
+        thumb_btn, thumb_flex = "Stick", 1.0
+    elif bool(state.ulButtonTouched & (1 << openvr.k_EButton_SteamVR_Touchpad)):
+        thumb_btn, thumb_flex = "Stick", 0.5
+
+    grip_pressed = bool(state.ulButtonPressed & (1 << openvr.k_EButton_Grip))
+    grip_touched = bool(state.ulButtonTouched & (1 << openvr.k_EButton_Grip))
+    grip_flex = 1.0 if grip_pressed else (0.5 if grip_touched else 0.0)
+    return index_flex, (thumb_btn, thumb_flex, stick_x, stick_y), grip_flex
+
+
+def get_vr_flex():
+    """Return (right_vr, left_vr) in a single device-table scan."""
+    return (_read_vr_controller(openvr.TrackedControllerRole_RightHand),
+            _read_vr_controller(openvr.TrackedControllerRole_LeftHand))
 
 
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
 root = tk.Tk()
-root.title("SloppyHands Tracker (v3 - dual hand + smoothing)")
+root.title("SloppyHands Tracker")
 root.geometry("980x820")
 root.configure(bg="#222")
 
@@ -654,7 +676,7 @@ _dev_style.map("Treeview", background=[("selected", "#333")],
 _dev_style.map("Treeview.Heading", background=[("active", "#222")])
 
 dev_tree = ttk.Treeview(
-    dev_frame, columns=("mac", "ip", "fw", "ch", "hand", "rssi", "batt", "last"),
+    dev_frame, columns=("mac", "ip", "fw", "ch", "hand", "rssi", "batt", "last", "spacer"),
     show="headings", height=4, selectmode="none")
 for _key, _txt, _w, _anchor in (
         ("mac", "MAC", 140, "w"), ("ip", "IP", 120, "w"),
@@ -663,6 +685,10 @@ for _key, _txt, _w, _anchor in (
         ("batt", "Batt", 55, "center"), ("last", "Last", 65, "w")):
     dev_tree.heading(_key, text=_txt, anchor=_anchor)
     dev_tree.column(_key, width=_w, minwidth=_w, anchor=_anchor, stretch=False)
+# Stretchable spacer column so the empty area right of the last data column
+# is filled (and colored by the dark fieldbackground) instead of showing white.
+dev_tree.heading("spacer", text="")
+dev_tree.column("spacer", width=0, minwidth=0, stretch=True)
 dev_tree.pack(fill=tk.X)
 
 
@@ -799,10 +825,9 @@ def refresh_device_values():
             rssi_txt = f"{hand_state.meta['rssi']}dBm"
         else:
             rssi_txt = "-"
-        # Battery: only meaningful from fw>=6 trackers; 255 = unknown/disabled.
+        # Battery: 255 = unknown/disabled.
         batt_pct = hand_state.meta.get("batt_pct") if hand_state is not None else None
         if hand_state is not None and hand_state.is_alive() \
-                and hand_state.fw >= 6 \
                 and isinstance(batt_pct, int) and batt_pct != 255:
             batt_txt = f"{batt_pct}%"
         else:
@@ -1359,15 +1384,16 @@ class HandView:
             self._all_items.extend(self.finger_joints[f])
         # bars are always visible (even when hand offline) so not in _all_items
 
-    def _update_finger(self, name, prox_flex, distal_flex, angle_override=None):
+    def _update_finger(self, name, prox_flex, distal_flex, angle_override=None, mirror=False):
         base_angle = self.default_angles[name] if angle_override is None else angle_override
         lengths = self.lengths[name]
         max_bend = math.radians(80)
         coupling = coupling_var.get()
         effective_distal = min(1.0, max(distal_flex, prox_flex * coupling))
-        a1 = math.radians(base_angle) + (prox_flex * max_bend)
-        a2 = a1 + (effective_distal * max_bend)
-        a3 = a2 + (effective_distal * max_bend)
+        s = -1 if mirror else 1
+        a1 = math.radians(base_angle) + s * (prox_flex * max_bend)
+        a2 = a1 + s * (effective_distal * max_bend)
+        a3 = a2 + s * (effective_distal * max_bend)
         sx, sy = self.mcp[name]
         j1x = sx + lengths[0] * math.cos(a1); j1y = sy + lengths[0] * math.sin(a1)
         j2x = j1x + lengths[1] * math.cos(a2); j2y = j1y + lengths[1] * math.sin(a2)
@@ -1423,10 +1449,56 @@ LEFT_LAYOUT = {
     "wrist": (220, 380),
     "mcp":   {"thumb": (340, 300), "index": (310, 230), "mid": (270, 210),
               "ring": (220, 220), "pinky": (170, 250)},
-    "angles": {"thumb": -80, "index": -75, "mid": -90, "ring": -105, "pinky": -120},
+    "angles": {"index": -75, "mid": -90, "ring": -105, "pinky": -120},
     "lengths": {"thumb": [40, 30, 25], "index": [55, 35, 25], "mid": [60, 40, 25],
                 "ring": [55, 35, 25], "pinky": [40, 25, 20]},
 }
+
+
+def _thumb_pose(thumb_btn, thumb_raw, stick_x, stick_y, hand):
+    """Map SteamVR thumb state to (base_angle_deg, flex) for a hand.
+    The left hand mirrors the right with its own base angles."""
+    if thumb_btn == "A":        # right "A" / left "X"
+        return (-100, thumb_raw * 0.8) if hand == "right" else (-80, thumb_raw * 0.8)
+    if thumb_btn == "B":        # right "B" / left "Y"
+        return (-120, thumb_raw * 0.6) if hand == "right" else (-60, thumb_raw * 0.6)
+    if thumb_btn == "Stick":
+        angle = -140 + stick_x * 30 if hand == "right" else -40 + stick_x * 30
+        f = min(1.0, max(0.0, 0.4 - stick_y * 0.4))
+        return angle, (1.0 if thumb_raw == 1.0 else f)
+    # No button: resting thumb (left is the mirror of right across the palm).
+    return (-150, 0.0) if hand == "right" else (-30, 0.0)
+
+
+def _fused_hand_flex(hs, vr_data, hand):
+    """Fuse SteamVR thumb/index with electrode data; the electrode wins when a
+    joint is mapped. Mid falls back to grip when both mid joints read 0.
+    Returns (thumb_p, thumb_d, index_p, index_d, mid_p, mid_d, thumb_angle)."""
+    index_flex, (thumb_btn, thumb_raw, stick_x, stick_y), grip_flex = vr_data
+    thumb_angle, thumb_f = _thumb_pose(thumb_btn, thumb_raw, stick_x, stick_y, hand)
+
+    t_p = _joint_channel(hs, "thumb_p")
+    t_d = _joint_channel(hs, "thumb_d")
+    if t_p is not None or t_d is not None:
+        thumb_p = normalize_joint(hs, "thumb_p") if t_p is not None else thumb_f
+        thumb_d = normalize_joint(hs, "thumb_d") if t_d is not None else thumb_p
+    else:
+        thumb_p, thumb_d = thumb_f, thumb_f
+
+    i_p = _joint_channel(hs, "index_p")
+    i_d = _joint_channel(hs, "index_d")
+    if i_p is not None or i_d is not None:
+        index_p = normalize_joint(hs, "index_p") if i_p is not None else index_flex
+        index_d = normalize_joint(hs, "index_d") if i_d is not None else index_p
+    else:
+        index_p, index_d = index_flex, index_flex
+
+    mid_p = normalize_joint(hs, "mid_p")
+    mid_d = normalize_joint(hs, "mid_d")
+    if mid_d == 0.0 and mid_p == 0.0:
+        mid_d = grip_flex  # fallback to SteamVR grip when electrodes unassigned
+
+    return thumb_p, thumb_d, index_p, index_d, mid_p, mid_d, thumb_angle
 
 
 def render_right(hs, vr_data):
@@ -1437,60 +1509,33 @@ def render_right(hs, vr_data):
         return
     right_view.set_skeleton_visible(True)
 
-    index_flex, (thumb_btn, thumb_raw, stick_x, stick_y), grip_flex = vr_data
-    if thumb_btn == "A":
-        thumb_angle, thumb_f = -100, thumb_raw * 0.8
-    elif thumb_btn == "B":
-        thumb_angle, thumb_f = -120, thumb_raw * 0.6
-    elif thumb_btn == "Stick":
-        thumb_angle = -140 + (stick_x * 30)
-        thumb_f = min(1.0, max(0.0, 0.4 - (stick_y * 0.4)))
-        if thumb_raw == 1.0:
-            thumb_f = 1.0
-    else:
-        thumb_angle, thumb_f = -150, 0.0
-
-    idx_t = _joint_channel(hs, "thumb_p")
-    idx_d = _joint_channel(hs, "thumb_d")
-    if idx_t is not None or idx_d is not None:
-        thumb_p = normalize_joint(hs, "thumb_p") if idx_t is not None else thumb_f
-        thumb_d = normalize_joint(hs, "thumb_d") if idx_d is not None else thumb_p
-    else:
-        thumb_p, thumb_d = thumb_f, thumb_f
-
-    idx_ip = _joint_channel(hs, "index_p")
-    idx_id = _joint_channel(hs, "index_d")
-    if idx_ip is not None or idx_id is not None:
-        i_p = normalize_joint(hs, "index_p") if idx_ip is not None else index_flex
-        i_d = normalize_joint(hs, "index_d") if idx_id is not None else i_p
-    else:
-        i_p, i_d = index_flex, index_flex
-
-    mid_p = normalize_joint(hs, "mid_p")
-    mid_d = normalize_joint(hs, "mid_d")
-    if mid_d == 0.0 and mid_p == 0.0:
-        mid_d = grip_flex  # fallback to SteamVR grip when electrodes unassigned
+    thumb_p, thumb_d, index_p, index_d, mid_p, mid_d, thumb_angle = \
+        _fused_hand_flex(hs, vr_data, "right")
 
     right_view._update_finger("thumb",  thumb_p, thumb_d, angle_override=thumb_angle)
-    right_view._update_finger("index", i_p, i_d)
+    right_view._update_finger("index", index_p, index_d)
     right_view._update_finger("mid",    mid_p, mid_d)
     right_view._update_finger("ring",   normalize_joint(hs, "ring_p"),  normalize_joint(hs, "ring_d"))
     right_view._update_finger("pinky",  normalize_joint(hs, "pinky_p"), normalize_joint(hs, "pinky_d"))
     right_view.update_bars(_bars_for(hs))
 
 
-def render_left(hs):
-    """Left hand: all joints from ESP32 electrodes."""
+def render_left(hs, vr_data):
+    """Left hand: thumb + index from SteamVR (overridable), other joints ESP32."""
     if not hs.is_alive():
         left_view.set_skeleton_visible(False)
         left_view.update_bars(_bars_for(hs))
         return
     left_view.set_skeleton_visible(True)
-    left_view._update_finger("thumb", normalize_joint(hs, "thumb_p"), normalize_joint(hs, "thumb_d"))
-    left_view._update_finger("index", normalize_joint(hs, "index_p"), normalize_joint(hs, "index_d"))
-    left_view._update_finger("mid",   normalize_joint(hs, "mid_p"),   normalize_joint(hs, "mid_d"))
-    left_view._update_finger("ring",  normalize_joint(hs, "ring_p"),  normalize_joint(hs, "ring_d"))
-    left_view._update_finger("pinky", normalize_joint(hs, "pinky_p"), normalize_joint(hs, "pinky_d"))
+
+    thumb_p, thumb_d, index_p, index_d, mid_p, mid_d, thumb_angle = \
+        _fused_hand_flex(hs, vr_data, "left")
+
+    left_view._update_finger("thumb",  thumb_p, thumb_d, angle_override=thumb_angle, mirror=True)
+    left_view._update_finger("index", index_p, index_d)
+    left_view._update_finger("mid",    mid_p, mid_d)
+    left_view._update_finger("ring",   normalize_joint(hs, "ring_p"),  normalize_joint(hs, "ring_d"))
+    left_view._update_finger("pinky",  normalize_joint(hs, "pinky_p"), normalize_joint(hs, "pinky_d"))
     left_view.update_bars(_bars_for(hs))
 
 
@@ -1522,35 +1567,18 @@ set_source(_boot)   # opens the transport (and persists the choice)
 # Packet handling
 # ---------------------------------------------------------------------------
 def parse_data_fields(data):
-    """Unpack a DATA packet (v6 fw>=6, legacy v4 fw5, or ancient v3).
-    Returns a tuple
+    """Unpack a DATA packet (69 bytes). Returns a tuple
     (packet_id, uptime, filtered, touch, fdc_raw, sensor_type,
      i2c_ms, loop_ms, rssi, batt_mv, batt_pct) or None if malformed."""
-    if len(data) >= DATA_LEN:
-        fields = struct.unpack(DATA_FMT, data[:DATA_LEN])
-        return (
-            fields[4], fields[5],
-            list(fields[6:18]), fields[18], list(fields[19:23]),
-            fields[23], fields[25], fields[26], fields[27],
-            fields[29], fields[30],
-        )
-    if len(data) >= DATA_LEN_V4:
-        fields = struct.unpack(DATA_FMT_V4, data[:DATA_LEN_V4])
-        return (
-            fields[4], fields[5],
-            list(fields[6:18]), fields[18], list(fields[19:23]),
-            fields[23], fields[25], fields[26], fields[27],
-            None, None,
-        )
-    if len(data) >= DATA_LEN_V3:
-        fields = struct.unpack(DATA_FMT_V3, data[:DATA_LEN_V3])
-        return (
-            fields[4], fields[5],
-            list(fields[6:18]), fields[18], [0, 0, 0, 0],
-            SENSOR_MPR121, fields[19], fields[20], fields[21],
-            None, None,
-        )
-    return None
+    if len(data) < DATA_LEN:
+        return None
+    fields = struct.unpack(DATA_FMT, data[:DATA_LEN])
+    return (
+        fields[4], fields[5],
+        list(fields[6:18]), fields[18], list(fields[19:23]),
+        fields[23], fields[25], fields[26], fields[27],
+        fields[29], fields[30],
+    )
 
 
 def deliver_data_mac(mac_str, parsed, dongle_rssi=None, fw=0):
@@ -1747,7 +1775,7 @@ def handle_packet(data, addr):
         target.meta = {"i2c_ms": i2c_ms, "loop_ms": loop_ms, "rssi": rssi,
                        "uptime": uptime, "batt_mv": batt_mv, "batt_pct": batt_pct}
         if fw > target.fw:
-            target.fw = fw          # needed to gate fw>=6 features like battery
+            target.fw = fw
         target.last_seen = time.time()
         if packet_id > target.last_packet_id:
             target.last_packet_id = packet_id
@@ -1829,7 +1857,7 @@ def update_gui():
         if hs.is_alive():
             batt_pct = hs.meta.get("batt_pct")
             batt_txt = ""
-            if hs.fw >= 6 and isinstance(batt_pct, int) and batt_pct != 255:
+            if isinstance(batt_pct, int) and batt_pct != 255:
                 batt_txt = f" bat={batt_pct}%"
             parts.append(f"{h.upper()}:{hs.mac} id={hs.last_packet_id} "
                          f"sensor={SENSOR_LABELS.get(hs.sensor_type, '?')} "
@@ -1844,8 +1872,9 @@ def update_gui():
     diag_label.configure(fg="#FF5555" if offline else "#00FF00")
 
     # 5) render -- pre-allocated items, just coords() updates
-    render_right(hands["right"], get_vr_flex())
-    render_left(hands["left"])
+    right_vr, left_vr = get_vr_flex()
+    render_right(hands["right"], right_vr)
+    render_left(hands["left"], left_vr)
 
     root.after(33, update_gui)   # 30 FPS - plenty for a skeleton preview
 
@@ -1876,7 +1905,7 @@ def on_closing():
 
 root.protocol("WM_DELETE_WINDOW", on_closing)
 # Initial render using pre-allocated view objects.
-render_right(hands["right"], (0.0, ("None", 0.0, 0.0, 0.0), 0.0))
-render_left(hands["left"])
+render_right(hands["right"], NEUTRAL_VR)
+render_left(hands["left"], NEUTRAL_VR)
 root.after(33, update_gui)   # 30 FPS - plenty for a skeleton preview
 root.mainloop()
